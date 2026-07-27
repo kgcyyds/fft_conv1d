@@ -130,6 +130,11 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     {
         usedCoreNum = 1;
     }
+    // 调试期强制单核，排除多核相关因素（见 fft_conv1d_tiling.h 的开关说明）
+    if (FFT_CONV1D_FORCE_SINGLE_CORE != 0)
+    {
+        usedCoreNum = 1;
+    }
     const uint32_t rowsPerCore = CeilDiv(totalRows, usedCoreNum);
 
     // direct 路径的输出分块长度；必须 >= K-1，否则首块的零前缀逻辑不成立

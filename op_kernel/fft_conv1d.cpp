@@ -44,6 +44,20 @@ constexpr float TWO_PI = 6.283185307179586f;
 // 从而确认问题是否出在 Cube 写 GM 对 Vector 的可见性上。
 constexpr bool CONSERVATIVE_SYNC = false;
 
+// ---------------------------------------------------------------------------
+// 调试开关：把中间结果直接写进输出张量，用现有测试链路读回来定位
+// ---------------------------------------------------------------------------
+// 不引入任何新 API（只用已经在用的 DataCopyPad），npu_out.bin 里读到的就是选中的
+// 那一级中间结果。用 scripts/dump_expect.py 生成对应的期望值比对。
+//   0 = 正常输出
+//   1 = Dr   常量表实部（第 0 行应全为 1.0，因为 k=0 时 cos(0)=1）
+//   2 = Tr   旋转因子实部（同上，第 0 行全 1.0）
+//   3 = scr0 补零后的输入行（前 L 个应等于输入本身）  <-- 先测这个
+//   4 = scr1 步骤 A 的 Br = Dr @ xmat
+//   5 = scr5 正变换输出实部
+//   6 = Kfr  kernel 频谱实部
+constexpr int32_t DEBUG_DUMP_STAGE = 0;
+
 __aicore__ inline void CubeVecSync()
 {
     if (CONSERVATIVE_SYNC)
@@ -646,7 +660,32 @@ class FftConv1dFft
     __aicore__ inline void StoreOutput(int32_t row)
     {
         const uint64_t yBase = static_cast<uint64_t>(row) * L_;
-        WsToOut(yBase, Scr(9), L_);
+        uint64_t src = Scr(9);
+        if (DEBUG_DUMP_STAGE == 1)
+        {
+            src = offDr_;
+        }
+        else if (DEBUG_DUMP_STAGE == 2)
+        {
+            src = offTr_;
+        }
+        else if (DEBUG_DUMP_STAGE == 3)
+        {
+            src = Scr(0);
+        }
+        else if (DEBUG_DUMP_STAGE == 4)
+        {
+            src = Scr(1);
+        }
+        else if (DEBUG_DUMP_STAGE == 5)
+        {
+            src = Scr(5);
+        }
+        else if (DEBUG_DUMP_STAGE == 6)
+        {
+            src = offKfr_ + static_cast<uint64_t>(row % H_) * N_;
+        }
+        WsToOut(yBase, src, L_);
     }
 
     __aicore__ inline void WsToOut(uint64_t yOff, uint64_t wsOff, int32_t count)
