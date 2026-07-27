@@ -195,8 +195,12 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     }
     else
     {
+        // DIRECT 是纯 Vector 路径，kernel 里按 GetBlockIdx() 分片，
+        // 而 MIX 模式下 AIV 的 GetBlockIdx() 范围是 [0, blockDim*2)，
+        // 所以必须按 blockDim*2 份分配，否则最后一半 AIV 会越界写。
+        // （当前之所以没暴露，是越界部分正好落进了系统 workspace 区。）
         const size_t rowLen = ((static_cast<size_t>(K) - 1 + L + 7) / 8) * 8;
-        userWorkspace = static_cast<size_t>(usedCoreNum) * rowLen * sizeof(float);
+        userWorkspace = 2 * static_cast<size_t>(usedCoreNum) * rowLen * sizeof(float);
     }
     const size_t sysWorkspace = static_cast<size_t>(ascendcPlatform.GetLibApiWorkSpaceSize());
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);

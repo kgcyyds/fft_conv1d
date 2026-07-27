@@ -29,6 +29,50 @@ constexpr int32_t VEC_CHUNK = 2048;  // Vector 逐点运算的分块长度（flo
 constexpr int32_t TMP_BUF_BYTES = 8192; // Cos/Sin/Fmod 需要的 sharedTmpBuffer
 constexpr float TWO_PI = 6.283185307179586f;
 
+// ---------------------------------------------------------------------------
+// 优化开关：Cube -> Vector 边界是否插全局栅栏
+// ---------------------------------------------------------------------------
+// 原实现在 Forward/Inverse/Pointwise 里每个 Cube->Vector 边界都调 SyncAll()，
+// 每行 15 次全局栅栏。这是保守写法，两条依据说明它可以去掉：
+//   1. IterateAll 模板默认 sync=true，文档明确“需要同步等待 IterateAll 执行结束”，
+//      Cube/Vector 的握手由 Matmul API 自己完成；
+//   2. 阶段 2 每个核只读写自己的 scratch（offScr_ 按 blockIdx 分片），无跨核依赖，
+//      全局栅栏在这里没有任何语义作用。
+// 真正需要的跨核栅栏只有两处，保留在 Process() 里：常量表就绪、kernel 频谱就绪。
+//
+// 若去栅栏后 FFT 路径数值出错，把下面这行改回 true 即可完全恢复原行为，
+// 从而确认问题是否出在 Cube 写 GM 对 Vector 的可见性上。
+constexpr bool CONSERVATIVE_SYNC = false;
+
+__aicore__ inline void CubeVecSync()
+{
+    if (CONSERVATIVE_SYNC)
+    {
+        SyncAll();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MIX 模式下取一致的 block 号
+// ---------------------------------------------------------------------------
+// 关键事实：KERNEL_TYPE_MIX_AIC_1_2 下同一份代码在 AIC 和 AIV 上都会执行，
+// 但两者的 GetBlockIdx() 取值范围不同：
+//   AIC: [0, blockDim)        AIV: [0, blockDim * 2)
+// （AscendC-S4 模板对 Vector 循环用 cnt = GetBlockNum()*GetTaskRation() 也印证了这点）
+//
+// 如果直接用 GetBlockIdx() 去切 scratch，Cube 会把 GEMM 结果写进 slot b，
+// 而与它配对的两个 AIV 会去读 slot 2b 和 2b+1 —— 其中一个永远读到从未被写过的
+// 区域（内容为 0），另一个还会越界写到 workspace 之外。
+// 这正是 “FFT 结果很多地方是 0” 的成因。
+//
+// GetTaskRation() 在 Cube 上返回 1、在 Vector 上返回 2，所以除一下就能得到
+// 两边一致的 block 号。代价是同一 block 的两个 AIV 做重复的 Vector 工作
+// （结果相同，无害），把 Vector 拆开是后续优化项。
+__aicore__ inline int32_t CoreIdx()
+{
+    return static_cast<int32_t>(GetBlockIdx() / GetTaskRation());
+}
+
 __aicore__ inline int32_t AlignUp8(int32_t x)
 {
     return (x + 7U) & ~7U;
@@ -215,7 +259,7 @@ class FftConv1dFft
         offKfr_ = 4ULL * N_;
         offKfi_ = 4ULL * N_ + static_cast<uint64_t>(H_) * N_;
         offScr_ = 4ULL * N_ + 2ULL * H_ * N_ +
-                  static_cast<uint64_t>(GetBlockIdx()) * SCRATCH_BUFS * N_;
+                  static_cast<uint64_t>(CoreIdx()) * SCRATCH_BUFS * N_;
 
         const int32_t chunk = AlignUp8(VEC_CHUNK) * sizeof(float);
         pipe->InitBuffer(bA_, chunk);
@@ -236,7 +280,7 @@ class FftConv1dFft
         const int32_t chPerCore = (H_ + cores_ - 1) / cores_;
         for (int32_t i = 0; i < chPerCore; ++i)
         {
-            const int32_t h = static_cast<int32_t>(GetBlockIdx()) + i * cores_;
+            const int32_t h = CoreIdx() + i * cores_;
             const bool active = (h < H_);
             PrepareKernelRow(active ? h : 0, active);
             Forward(); // scr0 -> (scr5, scr6)
@@ -252,7 +296,7 @@ class FftConv1dFft
         const int32_t rowsPerCore = (rows_ + cores_ - 1) / cores_;
         for (int32_t i = 0; i < rowsPerCore; ++i)
         {
-            const int32_t row = static_cast<int32_t>(GetBlockIdx()) + i * cores_;
+            const int32_t row = CoreIdx() + i * cores_;
             const bool active = (row < rows_);
             PrepareDataRow(active ? row : 0, active);
             Forward();                       // scr0 -> (scr5, scr6)
@@ -294,7 +338,7 @@ class FftConv1dFft
         CreateVecIndex(idx, 0.0f, len); // idx[n] = n
         PipeBarrier<PIPE_V>();
 
-        for (int32_t k = static_cast<int32_t>(GetBlockIdx()); k < N1_; k += cores_)
+        for (int32_t k = CoreIdx(); k < N1_; k += cores_)
         {
             // ---- D 的第 k 行，模 N1 ----
             EmitRow(idx, prod, modv, ang, re, im, tmp, len, k,
@@ -544,21 +588,21 @@ class FftConv1dFft
         // 步骤 A：Br = Dr @ xmat, Bi = Di @ xmat（实输入 => 只要 2 次实数 GEMM）
         Gemm(Scr(1), offDr_, Scr(0));
         Gemm(Scr(2), offDi_, Scr(0));
-        SyncAll();
+        CubeVecSync();
         // 步骤 B：乘旋转因子 W_N^{k1·n2}
         ComplexMulInPlace(Scr(1), Scr(2), offTr_, offTi_, false);
-        SyncAll();
+        CubeVecSync();
         // 步骤 C：Cr = Br@D - Bi@Di，Ci = Br@Di + Bi@Dr（D 对称，无需转置）
         Gemm(Scr(3), Scr(1), offDr_);
         Gemm(Scr(4), Scr(2), offDi_);
-        SyncAll();
+        CubeVecSync();
         SubTo(Scr(5), Scr(3), Scr(4));
-        SyncAll();
+        CubeVecSync();
         Gemm(Scr(3), Scr(1), offDi_);
         Gemm(Scr(4), Scr(2), offDr_);
-        SyncAll();
+        CubeVecSync();
         AddTo(Scr(6), Scr(3), Scr(4));
-        SyncAll();
+        CubeVecSync();
     }
 
     // ---------------- 频域逐点乘 ----------------
@@ -566,7 +610,7 @@ class FftConv1dFft
     {
         ComplexMulInPlace(Scr(5), Scr(6), offKfr_ + static_cast<uint64_t>(h) * N_,
                           offKfi_ + static_cast<uint64_t>(h) * N_, false);
-        SyncAll();
+        CubeVecSync();
     }
 
     // ---------------- 逆变换：(scr5, scr6) -> scr9（实） ----------------
@@ -575,23 +619,23 @@ class FftConv1dFft
         // 步骤 A'：Er = Yr@Dr + Yi@Di，Ei = Yi@Dr - Yr@Di（conj(D) = (Dr, -Di)）
         Gemm(Scr(3), Scr(5), offDr_);
         Gemm(Scr(4), Scr(6), offDi_);
-        SyncAll();
+        CubeVecSync();
         AddTo(Scr(7), Scr(3), Scr(4));
-        SyncAll();
+        CubeVecSync();
         Gemm(Scr(3), Scr(5), offDi_);
         Gemm(Scr(4), Scr(6), offDr_);
-        SyncAll();
+        CubeVecSync();
         SubTo(Scr(8), Scr(4), Scr(3));
-        SyncAll();
+        CubeVecSync();
         // 步骤 B'：乘共轭旋转因子
         ComplexMulInPlace(Scr(7), Scr(8), offTr_, offTi_, true);
-        SyncAll();
+        CubeVecSync();
         // 步骤 C'：y = (Dr@Er + Di@Ei)/N（实输出 => 只取实部，2 次实数 GEMM）
         Gemm(Scr(3), offDr_, Scr(7));
         Gemm(Scr(4), offDi_, Scr(8));
-        SyncAll();
+        CubeVecSync();
         AddScaleTo(Scr(9), Scr(3), Scr(4), 1.0f / static_cast<float>(N_));
-        SyncAll();
+        CubeVecSync();
     }
 
     // ---------------- 输出裁剪 ----------------
