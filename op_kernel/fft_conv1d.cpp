@@ -327,38 +327,50 @@ class FftConv1dFft
         LocalTensor<float> di = bDi_.Get<float>();
         LocalTensor<float> tr = bTr_.Get<float>();
         LocalTensor<float> ti = bTi_.Get<float>();
-        LocalTensor<float> idx = bZr_.Get<float>();   // 借用工作缓冲
-        LocalTensor<float> modv = bZi_.Get<float>();
+        LocalTensor<float> idx = bZr_.Get<float>(); // 借用工作缓冲
+        LocalTensor<float> ang = bZi_.Get<float>();
         LocalTensor<uint8_t> tmp = bTmp_.Get<uint8_t>();
 
-        CreateVecIndex(idx, 0.0f, N1_); // idx[n] = n
+        CreateVecIndex(idx, 0.0f, N1_); // idx[n] = n（A2 支持 float）
         PipeBarrier<PIPE_V>();
 
         for (int32_t k = 0; k < N1_; ++k)
         {
-            EmitRow(dr[k * N1_], di[k * N1_], idx, modv, tmp, k, static_cast<float>(N1_));
-            EmitRow(tr[k * N1_], ti[k * N1_], idx, modv, tmp, k, static_cast<float>(N_));
+            EmitRow(dr[k * N1_], di[k * N1_], idx, ang, tmp, k, N1_);
+            EmitRow(tr[k * N1_], ti[k * N1_], idx, ang, tmp, k, N_);
         }
         // 后面要用 GetValue 从标量单元读这些表，必须等 Vector 写完
         SetFlag<HardEvent::V_S>(EVENT_ID0);
         WaitFlag<HardEvent::V_S>(EVENT_ID0);
     }
 
+    // 生成一行：re[n] = cos(θ)，im[n] = sin(θ)，θ = -2π·k·n/M
+    //
+    // 全部用 Vector 指令，不做任何标量运算：AICore 的标量单元没有硬件除法器，
+    // 整数取模在 NPU 上不可用。而取模本来就不必要 —— cos/sin 是 2π 周期的，
+    // 取模只影响精度、不影响正确性。
+    //
+    // 两个 Muls 的**顺序不能合并**：必须先算出精确整数 k*n，再乘同一个 step。
+    //   正确：(k*n) * step        —— k*n 与 n*k 逐位相同 => D[k][n] == D[n][k] 精确成立
+    //   错误：n * (k*step)        —— 浮点乘不满足结合律，D 会失去对称性，
+    //                               而“D 对称所以不用转置”是本方案成立的前提
+    // k*n <= (N1-1)^2 <= 961 < 2^24，fp32 精确表示。
+    //
+    // 代价：D 表角度最大约 2π·961/32 ≈ 189 rad，fp32 下绝对误差约 1e-5，
+    //       cos/sin 误差同量级。在 1e-4 的目标内，首版本接受；
+    //       后续要更高精度可改用查表 + Gather 做角度规约。
+    //
+    // 另外 Cos/Sin 的 dst 与 src 必须是不同缓冲，不能原地覆盖。
     __aicore__ inline void EmitRow(const LocalTensor<float> &re, const LocalTensor<float> &im,
-                                   const LocalTensor<float> &idx, const LocalTensor<float> &modv,
-                                   const LocalTensor<uint8_t> &tmp, int32_t k, float mod)
+                                   const LocalTensor<float> &idx, const LocalTensor<float> &ang,
+                                   const LocalTensor<uint8_t> &tmp, int32_t k, int32_t mod)
     {
-        Muls(re, idx, static_cast<float>(k), N1_); // k*n（整数，fp32 精确）
+        Muls(ang, idx, static_cast<float>(k), N1_); // ang = k*n（精确整数）
         PipeBarrier<PIPE_V>();
-        Duplicate(modv, mod, N1_);
+        Muls(ang, ang, -TWO_PI / static_cast<float>(mod), N1_); // 乘同一个 step
         PipeBarrier<PIPE_V>();
-        Fmod(re, re, modv, tmp, N1_); // (k*n) mod M ∈ [0, M)
-        PipeBarrier<PIPE_V>();
-        Muls(re, re, -TWO_PI / mod, N1_); // 角度落在 (-2π, 0]
-        PipeBarrier<PIPE_V>();
-        Sin(im, re, tmp, N1_);
-        PipeBarrier<PIPE_V>();
-        Cos(re, re, tmp, N1_); // 注意先算 sin 再就地覆盖成 cos
+        Cos(re, ang, tmp, N1_); // dst != src
+        Sin(im, ang, tmp, N1_);
         PipeBarrier<PIPE_V>();
     }
 
