@@ -1,38 +1,18 @@
 /**
- * fft_conv1d AscendC kernel（v2，Ascend 910B / Atlas A2）
+ * fft_conv1d AscendC kernel（v1，Ascend 910B / Atlas A2）
  *
- * 语义（唯一语义）：
- *   output[b,h,t] = sum_{j=0}^{K-1} input[b,h,t-j] * kernel[h,j]，t-j<0 时 input 视为 0
- *   因果 depthwise 卷积，通道独立，不做通道间求和。数学卷积，非 cross-correlation。
+ * 语义：output[b,h,t] = sum_{j=0}^{K-1} input[b,h,t-j] * kernel[h,j]，t-j<0 时 input 视为 0
+ *       （因果 depthwise 卷积，通道独立，不做通道间求和）
+ *       flip_kernel=1 时为 corr 语义（等价于 kernel 时域翻转），见 §3。
  *
- * 两条路径（host tiling 静态分派）：
+ * 两条路径（host tiling 静态分派，kernel 侧不做动态判断）：
  *   ALGO_DIRECT：K < 64，直接因果卷积，纯 Vector
  *   ALGO_FFT   ：K >= 64，四步 Cooley-Tukey，Cube 做 GEMM + Vector 做旋转因子/逐点乘
  *
- * ---------------------------------------------------------------------------
- * v2 相对 v1 的优化（每一项都标注了依据）
- * ---------------------------------------------------------------------------
- * [O1] 去掉逐行 SyncAll。依据：`IterateAll` 模板默认 sync=true，文档明确
- *      "需要同步等待 IterateAll 执行结束"，Cube/Vector 握手由 API 自己完成。
- *      且阶段 2 每个核只访问自己的 scratch，无跨核依赖。
- *      全 kernel 只保留 2 次 SyncAll（常量表就绪、kernel 频谱就绪），
- *      v1 是每行 15 次全局栅栏。
- *
- * [O2] 用 IterateAll 的 enAtomic=1（AtomicAdd）做累加，消除全部 Vector 合并 pass。
- *      Cr = Br@Dr - Bi@Di 写成 Gemm(Cr,Br,Dr,0) + Gemm(Cr,Bi,Dn,1)，其中 Dn = -Di；
- *      末级 y = (Dr@Er + Di@Ei)/N 写成 Gemm(y,DrS,Er,0) + Gemm(y,DiS,Ei,1)，
- *      其中 DrS = Dr/N、DiS = Di/N，把归一化也折进常量表。
- *      => 每行少 5 个 Vector 全长 pass、少 2 个 scratch 缓冲、少约 15N 字节 GM 往返。
- *      注意首次调用必须 enAtomic=0（覆盖写），否则会累加到上一行的残留值上。
- *
- * [O3] 只清零补零区 [L, N) 而不是整个 [0, N)，省掉一遍 N 长度的 GM 写。
- *
- * [O4] direct 路径用 8 份移位副本消除 Vector 非对齐访问：
- *      抽头 j 的源偏移是 K-1-j，逐 j 变化必然非 32B 对齐，v1 因此每个抽头都单独
- *      从 GM 读一整块（K 次读放大）。注意偏移同余 8 的抽头之间相差 8 个 float = 32B，
- *      天然对齐，故只需预载 8 份移位副本，K 次 GM 读降为 min(8,K) 次。
- *
- * [O5] ComplexMul 一次性发起 4 个 DataCopyPad 再同步，而不是两两同步。
+ * v1 的分解取 N 为 4 的幂 => N1 = N2 = sqrt(N)，于是：
+ *   - D1 与 D2 是同一个矩阵 D（DFT 矩阵对称，且 N1==N2）
+ *   - 12 次 GEMM 形状统一为 (M=N1, K=N1, N=N1)，共用一个 Matmul 对象与一套 TCubeTiling
+ * 数值路径已在 python/fft_conv1d_four_step.py 的 plan_v1 中逐步验证。
  */
 #include "kernel_operator.h"
 #include "lib/matmul_intf.h"
@@ -41,29 +21,32 @@ using namespace AscendC;
 
 namespace
 {
-constexpr uint32_t ALGO_DIRECT = 0;
-constexpr uint32_t ALGO_FFT = 1;
+constexpr int32_t ALGO_DIRECT = 0;
+constexpr int32_t ALGO_FFT = 1;
 
-constexpr uint32_t SCRATCH_BUFS = 8;  // 与 host 侧 FFT_CONV1D_SCRATCH_BUFS 一致
-constexpr uint32_t VEC_CHUNK = 2048;  // Vector 逐点运算的分块长度（float 个数）
-constexpr uint32_t TMP_BUF_BYTES = 8192; // Cos/Sin/Fmod 需要的 sharedTmpBuffer
-constexpr uint32_t SHIFT_COPIES = 8;  // direct 路径移位副本数（32B / 4B = 8）
+constexpr int32_t SCRATCH_BUFS = 10; // 与 host 侧 FFT_CONV1D_SCRATCH_BUFS 保持一致
+constexpr int32_t VEC_CHUNK = 2048;  // Vector 逐点运算的分块长度（float 个数）
+constexpr int32_t TMP_BUF_BYTES = 8192; // Cos/Sin/Fmod 需要的 sharedTmpBuffer
 constexpr float TWO_PI = 6.283185307179586f;
 
-__aicore__ inline uint32_t AlignUp8(uint32_t x)
+__aicore__ inline int32_t AlignUp8(int32_t x)
 {
     return (x + 7U) & ~7U;
 }
 
-__aicore__ inline uint32_t MinU(uint32_t a, uint32_t b)
+__aicore__ inline int32_t MinU(int32_t a, int32_t b)
 {
     return a < b ? a : b;
 }
 } // namespace
 
 // ============================================================================
-// 路径一：直接因果卷积（纯 Vector）
+// 路径一：直接因果卷积（Vector）
 // ============================================================================
+// 实现要点：Ascend 的 Vector 指令要求 LocalTensor 操作数首地址 32B 对齐，
+// 而 out[t] += x[t-j]*k[j] 的滑窗天然产生非对齐偏移。解决办法是把
+// "K-1 个前导零 + 输入行" 物化到 workspace（GM 地址无对齐约束），
+// 每个抽头 j 从 GM 偏移处直接搬到 UB 的 0 号位置，UB 侧永远对齐。
 class FftConv1dDirect
 {
   public:
@@ -79,19 +62,17 @@ class FftConv1dDirect
         L_ = t.seqLen;
         K_ = t.kernelLen;
         rows_ = t.totalRows;
+        // flip_ = t.flipKernel;
         tile_ = t.tileLen;
         cores_ = t.usedCoreNum;
         rowLen_ = AlignUp8(K_ - 1 + L_);
-        nShift_ = MinU(SHIFT_COPIES, K_);
-        shiftCap_ = AlignUp8(tile_ + K_);
 
         xGm_.SetGlobalBuffer((__gm__ float *)x);
         wGm_.SetGlobalBuffer((__gm__ float *)w);
         yGm_.SetGlobalBuffer((__gm__ float *)y);
         wsGm_.SetGlobalBuffer((__gm__ float *)workspace);
 
-        // [O4] nShift_ 份移位副本，每份容量 tile+K
-        pipe->InitBuffer(bufShift_, nShift_ * shiftCap_ * sizeof(float));
+        pipe->InitBuffer(bufIn_, AlignUp8(tile_) * sizeof(float));
         pipe->InitBuffer(bufOut_, AlignUp8(tile_) * sizeof(float));
         pipe->InitBuffer(bufK_, AlignUp8(K_) * sizeof(float));
         pipe->InitBuffer(bufZero_, AlignUp8(K_ > 8 ? K_ : 8) * sizeof(float));
@@ -103,13 +84,13 @@ class FftConv1dDirect
         Duplicate(zeros, 0.0f, AlignUp8(K_ > 8 ? K_ : 8));
         PipeBarrier<PIPE_V>();
 
-        const uint32_t base = static_cast<uint32_t>(GetBlockIdx()) * rowLen_;
-        for (uint32_t row = static_cast<uint32_t>(GetBlockIdx()); row < rows_; row += cores_)
+        const int32_t base = static_cast<int32_t>(GetBlockIdx()) * rowLen_;
+        for (int32_t row = static_cast<int32_t>(GetBlockIdx()); row < rows_; row += cores_)
         {
             // input 布局 [B,H,L]，行号 row = b*H + h => 通道号 h = row % H
             LoadKernelRow(row % H_);
             BuildPaddedRow(row, base);
-            for (uint32_t t0 = 0; t0 < L_; t0 += tile_)
+            for (int32_t t0 = 0; t0 < L_; t0 += tile_)
             {
                 ComputeTile(row, base, t0, MinU(tile_, L_ - t0));
             }
@@ -118,19 +99,19 @@ class FftConv1dDirect
 
   private:
     // 把 kernel 的第 h 行搬进 UB，后续用 GetValue 取标量
-    __aicore__ inline void LoadKernelRow(uint32_t h)
+    __aicore__ inline void LoadKernelRow(int32_t h)
     {
         LocalTensor<float> kb = bufK_.Get<float>();
         DataCopyExtParams cp{1, K_ * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
         DataCopyPadExtParams<float> pad{false, 0, 0, 0};
         DataCopyPad(kb, wGm_[static_cast<uint64_t>(h) * K_], cp, pad);
-        SetFlag<HardEvent::MTE2_S>(EVENT_ID0); // 标量读取前必须等搬运完成
+        // 标量读取前必须等搬运完成
+        SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
         WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
     }
 
-    // 在 workspace 里物化 [K-1 个 0, x[row][0..L-1]]，
-    // 使所有抽头的取数都退化成 GM 上的普通偏移（GM 地址无对齐约束）
-    __aicore__ inline void BuildPaddedRow(uint32_t row, uint32_t base)
+    // 在 workspace 里物化 [K-1 个 0, x[row][0..L-1]]
+    __aicore__ inline void BuildPaddedRow(int32_t row, int32_t base)
     {
         if (K_ > 1)
         {
@@ -138,67 +119,57 @@ class FftConv1dDirect
             DataCopyExtParams zp{1, (K_ - 1) * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
             DataCopyPad(wsGm_[base], zeros, zp);
         }
-        LocalTensor<float> buf = bufShift_.Get<float>();
-        for (uint32_t t0 = 0; t0 < L_; t0 += tile_)
+        LocalTensor<float> in = bufIn_.Get<float>();
+        for (int32_t t0 = 0; t0 < L_; t0 += tile_)
         {
-            const uint32_t len = MinU(tile_, L_ - t0);
+            const int32_t len = MinU(tile_, L_ - t0);
             DataCopyExtParams cp{1, len * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
             DataCopyPadExtParams<float> pad{false, 0, 0, 0};
-            DataCopyPad(buf, xGm_[static_cast<uint64_t>(row) * L_ + t0], cp, pad);
+            DataCopyPad(in, xGm_[static_cast<uint64_t>(row) * L_ + t0], cp, pad);
             SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
             WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-            DataCopyPad(wsGm_[base + K_ - 1 + t0], buf, cp);
+            DataCopyExtParams op{1, len * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
+            DataCopyPad(wsGm_[base + K_ - 1 + t0], in, op);
             SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
             WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
         }
     }
 
-    __aicore__ inline void ComputeTile(uint32_t row, uint32_t base, uint32_t t0, uint32_t len)
+    __aicore__ inline void ComputeTile(int32_t row, int32_t base, int32_t t0, int32_t len)
     {
         LocalTensor<float> kb = bufK_.Get<float>();
         LocalTensor<float> out = bufOut_.Get<float>();
-        LocalTensor<float> shift = bufShift_.Get<float>();
-
-        // [O4] 预载 nShift_ 份移位副本：copy r 覆盖 xz[t0+r ...]
-        // 抽头 j 的源在 xz 里的起点是 t0+K-1-j，落在副本 r=(K-1-j)%8 的
-        // 第 (K-1-j-r) 个元素处，而 (K-1-j-r) 恒为 8 的倍数 => UB 侧 32B 对齐。
-        DataCopyPadExtParams<float> pad{false, 0, 0, 0};
-        for (uint32_t r = 0; r < nShift_; ++r)
-        {
-            // 该副本需要覆盖的最大抽头偏移
-            const uint32_t need = len + (K_ - 1 - r);
-            DataCopyExtParams cp{1, need * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
-            DataCopyPad(shift[r * shiftCap_], wsGm_[base + t0 + r], cp, pad);
-        }
-        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        LocalTensor<float> xin = bufIn_.Get<float>();
 
         Duplicate(out, 0.0f, AlignUp8(len));
         PipeBarrier<PIPE_V>();
-        for (uint32_t j = 0; j < K_; ++j)
+
+        for (int32_t j = 0; j < K_; ++j)
         {
-            const uint32_t d = K_ - 1 - j;      // 源相对 t0 的偏移
-            const uint32_t r = d % nShift_;     // 落在哪份副本
-            const uint32_t off = r * shiftCap_ + (d - r); // (d-r) 是 nShift_ 的倍数
-            Axpy(out, shift[off], kb.GetValue(j), len); // out += x[t0+..-j] * k[j]
+            // math 语义取 kernel[j]；corr 语义取 kernel[K-1-j]（等价于时域翻转）
+            const float kv = kb.GetValue(j);
+            // xz[t0 + K-1 - j] 即 x[t0 - j]，越界部分由零前缀保证为 0
+            DataCopyExtParams cp{1, len * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
+            DataCopyPadExtParams<float> pad{false, 0, 0, 0};
+            DataCopyPad(xin, wsGm_[base + t0 + K_ - 1 - j], cp, pad);
+            SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            Axpy(out, xin, kv, len); // out += x * k[j]
+            SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
         }
 
-        // 1) V -> MTE3：out 算完才能搬出
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
         DataCopyExtParams op{1, len * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
         DataCopyPad(yGm_[static_cast<uint64_t>(row) * L_ + t0], out, op);
-        // 2) V -> MTE2：shift 被 Axpy 读完，下一轮才能重载移位副本
-        SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
-        WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-        // 3) MTE3 -> V：out 搬完，下一轮才能 Duplicate 重写
         SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
         WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     }
 
     GlobalTensor<float> xGm_, wGm_, yGm_, wsGm_;
-    TBuf<TPosition::VECCALC> bufShift_, bufOut_, bufK_, bufZero_;
-    uint32_t H_, L_, K_, rows_, tile_, cores_, rowLen_, nShift_, shiftCap_;
+    TBuf<TPosition::VECCALC> bufIn_, bufOut_, bufK_, bufZero_;
+    int32_t H_, L_, K_, rows_, tile_, cores_, rowLen_;
 };
 
 // ============================================================================
@@ -226,6 +197,7 @@ class FftConv1dFft
         L_ = t.seqLen;
         K_ = t.kernelLen;
         rows_ = t.totalRows;
+        // flip_ = t.flipKernel;
         N_ = t.nFft;
         N1_ = t.nRadix;
         cores_ = t.usedCoreNum;
@@ -235,20 +207,17 @@ class FftConv1dFft
         yGm_.SetGlobalBuffer((__gm__ float *)y);
         wsGm_.SetGlobalBuffer((__gm__ float *)workspace);
 
-        // 常量表：Dr, Di, Dn(=-Di), DrS(=Dr/N), DiS(=Di/N), Tr, Ti
+        // workspace 布局（float 为单位），与 host 侧一致
         offDr_ = 0;
         offDi_ = N_;
-        offDn_ = 2ULL * N_;
-        offDrS_ = 3ULL * N_;
-        offDiS_ = 4ULL * N_;
-        offTr_ = 5ULL * N_;
-        offTi_ = 6ULL * N_;
-        offKfr_ = 7ULL * N_;
-        offKfi_ = 7ULL * N_ + static_cast<uint64_t>(H_) * N_;
-        offScr_ = 7ULL * N_ + 2ULL * H_ * N_ +
+        offTr_ = 2ULL * N_;
+        offTi_ = 3ULL * N_;
+        offKfr_ = 4ULL * N_;
+        offKfi_ = 4ULL * N_ + static_cast<uint64_t>(H_) * N_;
+        offScr_ = 4ULL * N_ + 2ULL * H_ * N_ +
                   static_cast<uint64_t>(GetBlockIdx()) * SCRATCH_BUFS * N_;
 
-        const uint32_t chunk = AlignUp8(VEC_CHUNK) * sizeof(float);
+        const int32_t chunk = AlignUp8(VEC_CHUNK) * sizeof(float);
         pipe->InitBuffer(bA_, chunk);
         pipe->InitBuffer(bB_, chunk);
         pipe->InitBuffer(bC_, chunk);
@@ -261,31 +230,44 @@ class FftConv1dFft
     __aicore__ inline void Process()
     {
         BuildTables();
-        SyncAll(); // 跨核：所有核都要读全部常量表
+        SyncAll();
 
-        // 阶段 1：每个通道的 kernel 频谱（写 workspace，供所有 batch 复用）
-        for (uint32_t h = static_cast<uint32_t>(GetBlockIdx()); h < H_; h += cores_)
+        // 阶段 1：每个通道的 kernel 频谱（写入 workspace，供所有 batch 复用）
+        const int32_t chPerCore = (H_ + cores_ - 1) / cores_;
+        for (int32_t i = 0; i < chPerCore; ++i)
         {
-            PrepareRow(wGm_, static_cast<uint64_t>(h) * K_, K_);
-            Forward(); // scr0 -> (scr3, scr4)
-            CopyRange(offKfr_ + static_cast<uint64_t>(h) * N_, Scr(3), N_);
-            CopyRange(offKfi_ + static_cast<uint64_t>(h) * N_, Scr(4), N_);
+            const int32_t h = static_cast<int32_t>(GetBlockIdx()) + i * cores_;
+            const bool active = (h < H_);
+            PrepareKernelRow(active ? h : 0, active);
+            Forward(); // scr0 -> (scr5, scr6)
+            if (active)
+            {
+                CopyRange(offKfr_ + static_cast<uint64_t>(h) * N_, Scr(5), N_);
+                CopyRange(offKfi_ + static_cast<uint64_t>(h) * N_, Scr(6), N_);
+            }
+            SyncAll();
         }
-        SyncAll(); // 跨核：核 A 写的 Kf[h] 会被核 B 读
 
-        // 阶段 2：逐行做 FFT 卷积。每个核只碰自己的 scratch，无跨核依赖 => 无栅栏 [O1]
-        for (uint32_t row = static_cast<uint32_t>(GetBlockIdx()); row < rows_; row += cores_)
+        // 阶段 2：逐行做 FFT 卷积
+        const int32_t rowsPerCore = (rows_ + cores_ - 1) / cores_;
+        for (int32_t i = 0; i < rowsPerCore; ++i)
         {
-            PrepareRow(xGm_, static_cast<uint64_t>(row) * L_, L_);
-            Forward();                       // scr0 -> (scr3, scr4)
-            PointwiseWithKernel(row % H_);   // (scr3,scr4) *= Kf[h]
-            Inverse();                       // (scr3,scr4) -> scr7
-            WsToOut(static_cast<uint64_t>(row) * L_, Scr(7), L_); // 因果裁剪：取前 L 点
+            const int32_t row = static_cast<int32_t>(GetBlockIdx()) + i * cores_;
+            const bool active = (row < rows_);
+            PrepareDataRow(active ? row : 0, active);
+            Forward();                       // scr0 -> (scr5, scr6)
+            PointwiseWithKernel(active ? (row % H_) : 0);
+            Inverse();                       // (scr5,scr6) -> scr9
+            if (active)
+            {
+                StoreOutput(row);
+            }
+            SyncAll();
         }
     }
 
   private:
-    __aicore__ inline uint64_t Scr(uint32_t idx) const
+    __aicore__ inline uint64_t Scr(int32_t idx) const
     {
         return offScr_ + static_cast<uint64_t>(idx) * N_;
     }
@@ -308,135 +290,187 @@ class FftConv1dFft
         LocalTensor<float> im = bF_.Get<float>();
         LocalTensor<uint8_t> tmp = bTmp_.Get<uint8_t>();
 
-        const uint32_t len = AlignUp8(N1_);
+        const int32_t len = AlignUp8(N1_);
         CreateVecIndex(idx, 0.0f, len); // idx[n] = n
         PipeBarrier<PIPE_V>();
 
-        for (uint32_t k = static_cast<uint32_t>(GetBlockIdx()); k < N1_; k += cores_)
+        for (int32_t k = static_cast<int32_t>(GetBlockIdx()); k < N1_; k += cores_)
         {
-            const uint64_t rowOff = static_cast<uint64_t>(k) * N1_;
-
-            // ---- D 的第 k 行（模 N1），同时派生 Dn / DrS / DiS ----
-            Angle(idx, prod, modv, ang, tmp, len, k, static_cast<float>(N1_));
-            Cos(re, ang, tmp, len);
-            Sin(im, ang, tmp, len);
-            PipeBarrier<PIPE_V>();
-            Store(re, offDr_ + rowOff);
-            Store(im, offDi_ + rowOff);
-            // Dn = -Di，供 AtomicAdd 表达减法 [O2]
-            Muls(prod, im, -1.0f, len);
-            PipeBarrier<PIPE_V>();
-            Store(prod, offDn_ + rowOff);
-            // DrS = Dr/N、DiS = Di/N，把 IRFFT 的 1/N 归一化折进常量表 [O2]
-            const float inv = 1.0f / static_cast<float>(N_);
-            Muls(prod, re, inv, len);
-            PipeBarrier<PIPE_V>();
-            Store(prod, offDrS_ + rowOff);
-            Muls(prod, im, inv, len);
-            PipeBarrier<PIPE_V>();
-            Store(prod, offDiS_ + rowOff);
-
-            // ---- T 的第 k 行（模 N）----
-            Angle(idx, prod, modv, ang, tmp, len, k, static_cast<float>(N_));
-            Cos(re, ang, tmp, len);
-            Sin(im, ang, tmp, len);
-            PipeBarrier<PIPE_V>();
-            Store(re, offTr_ + rowOff);
-            Store(im, offTi_ + rowOff);
+            // ---- D 的第 k 行，模 N1 ----
+            EmitRow(idx, prod, modv, ang, re, im, tmp, len, k,
+                    static_cast<float>(N1_), offDr_ + static_cast<uint64_t>(k) * N1_,
+                    offDi_ + static_cast<uint64_t>(k) * N1_);
+            // ---- T 的第 k 行，模 N ----
+            EmitRow(idx, prod, modv, ang, re, im, tmp, len, k,
+                    static_cast<float>(N_), offTr_ + static_cast<uint64_t>(k) * N1_,
+                    offTi_ + static_cast<uint64_t>(k) * N1_);
         }
     }
 
-    // ang[n] = -2π·((k·n) mod mod)/mod
-    __aicore__ inline void Angle(const LocalTensor<float> &idx, const LocalTensor<float> &prod,
-                                 const LocalTensor<float> &modv, const LocalTensor<float> &ang,
-                                 const LocalTensor<uint8_t> &tmp, uint32_t len, uint32_t k,
-                                 float mod)
+    __aicore__ inline void EmitRow(const LocalTensor<float> &idx, const LocalTensor<float> &prod,
+                                   const LocalTensor<float> &modv, const LocalTensor<float> &ang,
+                                   const LocalTensor<float> &re, const LocalTensor<float> &im,
+                                   const LocalTensor<uint8_t> &tmp, int32_t len, int32_t k,
+                                   float mod, uint64_t offR, uint64_t offI)
     {
-        Muls(prod, idx, static_cast<float>(k), len); // k*n（整数，fp32 精确表示）
+        Muls(prod, idx, static_cast<float>(k), len); // prod = k*n（整数，fp32 精确表示）
         PipeBarrier<PIPE_V>();
         Duplicate(modv, mod, len);
         PipeBarrier<PIPE_V>();
-        Fmod(prod, prod, modv, tmp, len); // (k*n) mod M ∈ [0, M)
+        Fmod(prod, prod, modv, tmp, len); // prod = (k*n) mod M ∈ [0, M)
         PipeBarrier<PIPE_V>();
         Muls(ang, prod, -TWO_PI / mod, len); // 角度落在 (-2π, 0]
         PipeBarrier<PIPE_V>();
-    }
-
-    __aicore__ inline void Store(const LocalTensor<float> &src, uint64_t off)
-    {
+        Cos(re, ang, tmp, len);
+        Sin(im, ang, tmp, len);
+        PipeBarrier<PIPE_V>();
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
         DataCopyExtParams cp{1, N1_ * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
-        DataCopyPad(wsGm_[off], src, cp);
+        DataCopyPad(wsGm_[offR], re, cp);
+        DataCopyPad(wsGm_[offI], im, cp);
         SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
         WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     }
 
     // ---------------- 输入准备 ----------------
-    // scr0 = [src 的 count 个元素, 0, ..., 0]，总长 N
-    // [O3] 只清 [count, N) 这段补零区，不再整段清零
-    __aicore__ inline void PrepareRow(const GlobalTensor<float> &src, uint64_t srcOff,
-                                      uint32_t count)
+    // scr0 = [行数据, 0, ..., 0]，长度 N
+    __aicore__ inline void FillZero(uint64_t off, int32_t count)
     {
-        LocalTensor<float> b = bA_.Get<float>();
-        // 先把有效数据搬过去
-        for (uint32_t o = 0; o < count; o += VEC_CHUNK)
-        {
-            const uint32_t len = MinU(VEC_CHUNK, count - o);
-            DataCopyExtParams cp{1, len * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
-            DataCopyPadExtParams<float> pad{false, 0, 0, 0};
-            DataCopyPad(b, src[srcOff + o], cp, pad);
-            SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-            WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-            DataCopyPad(wsGm_[Scr(0) + o], b, cp);
-            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-        }
-        // 再补零尾部
-        Duplicate(b, 0.0f, AlignUp8(VEC_CHUNK));
+        LocalTensor<float> z = bA_.Get<float>();
+        Duplicate(z, 0.0f, AlignUp8(VEC_CHUNK));
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        for (uint32_t o = count; o < N_; o += VEC_CHUNK)
+        for (int32_t o = 0; o < count; o += VEC_CHUNK)
         {
-            const uint32_t len = MinU(VEC_CHUNK, N_ - o);
+            const int32_t len = MinU(VEC_CHUNK, count - o);
             DataCopyExtParams cp{1, len * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
-            DataCopyPad(wsGm_[Scr(0) + o], b, cp);
+            DataCopyPad(wsGm_[off + o], z, cp);
         }
         SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
         WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     }
 
-    // ---------------- GEMM 封装 ----------------
-    // atomic=0 覆盖写，atomic=1 AtomicAdd 累加 [O2]
-    __aicore__ inline void Gemm(uint64_t oC, uint64_t oA, uint64_t oB, uint8_t atomic)
+    __aicore__ inline void GmToGm(uint64_t dstOff, const GlobalTensor<float> &src,
+                                  uint64_t srcOff, int32_t count)
     {
-        mm_.SetTensorA(wsGm_[oA]);
-        mm_.SetTensorB(wsGm_[oB]);
-        mm_.IterateAll(wsGm_[oC], atomic); // 默认 sync=true，返回即完成 [O1]
-        mm_.End();
-    }
-
-    // ---------------- Vector 逐点运算 ----------------
-    __aicore__ inline void CopyRange(uint64_t oDst, uint64_t oSrc, uint32_t count)
-    {
-        LocalTensor<float> a = bA_.Get<float>();
-        for (uint32_t o = 0; o < count; o += VEC_CHUNK)
+        LocalTensor<float> b = bA_.Get<float>();
+        for (int32_t o = 0; o < count; o += VEC_CHUNK)
         {
-            const uint32_t len = MinU(VEC_CHUNK, count - o);
+            const int32_t len = MinU(VEC_CHUNK, count - o);
             DataCopyExtParams cp{1, len * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
             DataCopyPadExtParams<float> pad{false, 0, 0, 0};
-            DataCopyPad(a, wsGm_[oSrc + o], cp, pad);
+            DataCopyPad(b, src[srcOff + o], cp, pad);
             SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
             WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-            DataCopyPad(wsGm_[oDst + o], a, cp);
+            DataCopyPad(wsGm_[dstOff + o], b, cp);
             SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
             WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
         }
     }
 
-    // (ar, ai) = (ar, ai) * (br, bi)，conjB 时用 (br, -bi)。4 次实乘。
-    // 选 4 乘而非 Karatsuba 3 乘：Vector 的乘加吞吐不是瓶颈（瓶颈在搬运），
-    // 3 乘要多 2 个临时缓冲和 5 次加减，UB 压力与指令数反而更差。
+    __aicore__ inline void PrepareKernelRow(int32_t h, bool active)
+    {
+        FillZero(Scr(0), N_);
+        if (active)
+        {
+            // flip_ 语义不在这里做翻转：改用 conj(K̂) + 输出循环移位，见 Process()
+            GmToGm(Scr(0), wGm_, static_cast<uint64_t>(h) * K_, K_);
+        }
+    }
+
+    __aicore__ inline void PrepareDataRow(int32_t row, bool active)
+    {
+        FillZero(Scr(0), N_);
+        if (active)
+        {
+            GmToGm(Scr(0), xGm_, static_cast<uint64_t>(row) * L_, L_);
+        }
+    }
+
+    // ---------------- GEMM 封装 ----------------
+    __aicore__ inline void Gemm(uint64_t oC, uint64_t oA, uint64_t oB)
+    {
+        mm_.SetTensorA(wsGm_[oA]);
+        mm_.SetTensorB(wsGm_[oB]);
+        mm_.IterateAll(wsGm_[oC]);
+        mm_.End();
+    }
+
+    // ---------------- Vector 逐点运算（全部经 UB 分块）----------------
+    // dst = a + b
+    __aicore__ inline void AddTo(uint64_t oDst, uint64_t oA, uint64_t oB)
+    {
+        BinaryOp(oDst, oA, oB, 0);
+    }
+    // dst = a - b
+    __aicore__ inline void SubTo(uint64_t oDst, uint64_t oA, uint64_t oB)
+    {
+        BinaryOp(oDst, oA, oB, 1);
+    }
+
+    __aicore__ inline void BinaryOp(uint64_t oDst, uint64_t oA, uint64_t oB, int32_t kind)
+    {
+        LocalTensor<float> a = bA_.Get<float>();
+        LocalTensor<float> b = bB_.Get<float>();
+        LocalTensor<float> c = bC_.Get<float>();
+        for (int32_t o = 0; o < N_; o += VEC_CHUNK)
+        {
+            const int32_t len = MinU(VEC_CHUNK, N_ - o);
+            LoadTwo(a, b, oA + o, oB + o, len);
+            if (kind == 0)
+            {
+                Add(c, a, b, len);
+            }
+            else
+            {
+                Sub(c, a, b, len);
+            }
+            StoreOne(c, oDst + o, len);
+        }
+    }
+
+    // dst = (a + b) * s
+    __aicore__ inline void AddScaleTo(uint64_t oDst, uint64_t oA, uint64_t oB, float s)
+    {
+        LocalTensor<float> a = bA_.Get<float>();
+        LocalTensor<float> b = bB_.Get<float>();
+        LocalTensor<float> c = bC_.Get<float>();
+        for (int32_t o = 0; o < N_; o += VEC_CHUNK)
+        {
+            const int32_t len = MinU(VEC_CHUNK, N_ - o);
+            LoadTwo(a, b, oA + o, oB + o, len);
+            Add(c, a, b, len);
+            PipeBarrier<PIPE_V>();
+            Muls(c, c, s, len);
+            StoreOne(c, oDst + o, len);
+        }
+    }
+
+    __aicore__ inline void CopyRange(uint64_t oDst, uint64_t oSrc, int32_t count)
+    {
+        LocalTensor<float> a = bA_.Get<float>();
+        for (int32_t o = 0; o < count; o += VEC_CHUNK)
+        {
+            const int32_t len = MinU(VEC_CHUNK, count - o);
+            LoadOne(a, oSrc + o, len);
+            StoreOne(a, oDst + o, len);
+        }
+    }
+
+    __aicore__ inline void NegRange(uint64_t oDst, uint64_t oSrc, int32_t count)
+    {
+        LocalTensor<float> a = bA_.Get<float>();
+        for (int32_t o = 0; o < count; o += VEC_CHUNK)
+        {
+            const int32_t len = MinU(VEC_CHUNK, count - o);
+            LoadOne(a, oSrc + o, len);
+            Muls(a, a, -1.0f, len);
+            StoreOne(a, oDst + o, len);
+        }
+    }
+
+    // (ar, ai) = (ar, ai) * (br, bi)，conjB 时用 (br, -bi)。4 次实乘，见设计文档 §6.4
     __aicore__ inline void ComplexMulInPlace(uint64_t oAr, uint64_t oAi, uint64_t oBr,
                                              uint64_t oBi, bool conjB)
     {
@@ -447,19 +481,11 @@ class FftConv1dFft
         LocalTensor<float> tr = bE_.Get<float>();
         LocalTensor<float> ti = bF_.Get<float>();
 
-        for (uint32_t o = 0; o < N_; o += VEC_CHUNK)
+        for (int32_t o = 0; o < N_; o += VEC_CHUNK)
         {
-            const uint32_t len = MinU(VEC_CHUNK, N_ - o);
-            DataCopyExtParams cp{1, len * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
-            DataCopyPadExtParams<float> pad{false, 0, 0, 0};
-            // [O5] 4 个搬运一起发，只同步一次
-            DataCopyPad(ar, wsGm_[oAr + o], cp, pad);
-            DataCopyPad(ai, wsGm_[oAi + o], cp, pad);
-            DataCopyPad(br, wsGm_[oBr + o], cp, pad);
-            DataCopyPad(bi, wsGm_[oBi + o], cp, pad);
-            SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
-            WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-
+            const int32_t len = MinU(VEC_CHUNK, N_ - o);
+            LoadTwo(ar, ai, oAr + o, oAi + o, len);
+            LoadTwo(br, bi, oBr + o, oBi + o, len);
             if (conjB)
             {
                 Muls(bi, bi, -1.0f, len);
@@ -471,67 +497,120 @@ class FftConv1dFft
             PipeBarrier<PIPE_V>();
             Sub(tr, tr, ti, len);
             PipeBarrier<PIPE_V>();
-            // 虚部：ar*bi + ai*br（ar 算完 ar*bi 后即失效，可复用为临时量）
+            // 虚部：ar*bi + ai*br（ar 在算完 ar*bi 后即失效，可安全复用为临时量）
             Mul(ti, ar, bi, len);
             PipeBarrier<PIPE_V>();
             Mul(ar, ai, br, len);
             PipeBarrier<PIPE_V>();
             Add(ti, ti, ar, len);
-
-            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
-            WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-            DataCopyPad(wsGm_[oAr + o], tr, cp);
-            DataCopyPad(wsGm_[oAi + o], ti, cp);
-            SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
-            WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+            StoreOne(tr, oAr + o, len);
+            StoreOne(ti, oAi + o, len);
         }
     }
 
-    // ---------------- 正变换：scr0（实，已补零）-> (scr3, scr4) ----------------
+    __aicore__ inline void LoadOne(const LocalTensor<float> &d, uint64_t off, int32_t len)
+    {
+        DataCopyExtParams cp{1, len * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
+        DataCopyPadExtParams<float> pad{false, 0, 0, 0};
+        DataCopyPad(d, wsGm_[off], cp, pad);
+        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    }
+
+    __aicore__ inline void LoadTwo(const LocalTensor<float> &d0, const LocalTensor<float> &d1,
+                                   uint64_t o0, uint64_t o1, int32_t len)
+    {
+        DataCopyExtParams cp{1, len * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
+        DataCopyPadExtParams<float> pad{false, 0, 0, 0};
+        DataCopyPad(d0, wsGm_[o0], cp, pad);
+        DataCopyPad(d1, wsGm_[o1], cp, pad);
+        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    }
+
+    __aicore__ inline void StoreOne(const LocalTensor<float> &s, uint64_t off, int32_t len)
+    {
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        DataCopyExtParams cp{1, len * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
+        DataCopyPad(wsGm_[off], s, cp);
+        SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+    }
+
+    // ---------------- 正变换：scr0（实，已补零）-> (scr5, scr6) ----------------
     __aicore__ inline void Forward()
     {
         // 步骤 A：Br = Dr @ xmat, Bi = Di @ xmat（实输入 => 只要 2 次实数 GEMM）
-        Gemm(Scr(1), offDr_, Scr(0), 0);
-        Gemm(Scr(2), offDi_, Scr(0), 0);
+        Gemm(Scr(1), offDr_, Scr(0));
+        Gemm(Scr(2), offDi_, Scr(0));
+        SyncAll();
         // 步骤 B：乘旋转因子 W_N^{k1·n2}
         ComplexMulInPlace(Scr(1), Scr(2), offTr_, offTi_, false);
-        // 步骤 C：Cr = Br@Dr - Bi@Di，Ci = Br@Di + Bi@Dr（D 对称，无需转置）
-        // 减法用 Dn = -Di 配合 AtomicAdd 表达，省掉 Vector 合并 pass [O2]
-        Gemm(Scr(3), Scr(1), offDr_, 0);
-        Gemm(Scr(3), Scr(2), offDn_, 1);
-        Gemm(Scr(4), Scr(1), offDi_, 0);
-        Gemm(Scr(4), Scr(2), offDr_, 1);
+        SyncAll();
+        // 步骤 C：Cr = Br@D - Bi@Di，Ci = Br@Di + Bi@Dr（D 对称，无需转置）
+        Gemm(Scr(3), Scr(1), offDr_);
+        Gemm(Scr(4), Scr(2), offDi_);
+        SyncAll();
+        SubTo(Scr(5), Scr(3), Scr(4));
+        SyncAll();
+        Gemm(Scr(3), Scr(1), offDi_);
+        Gemm(Scr(4), Scr(2), offDr_);
+        SyncAll();
+        AddTo(Scr(6), Scr(3), Scr(4));
+        SyncAll();
     }
 
     // ---------------- 频域逐点乘 ----------------
-    __aicore__ inline void PointwiseWithKernel(uint32_t h)
+    __aicore__ inline void PointwiseWithKernel(int32_t h)
     {
-        ComplexMulInPlace(Scr(3), Scr(4), offKfr_ + static_cast<uint64_t>(h) * N_,
+        ComplexMulInPlace(Scr(5), Scr(6), offKfr_ + static_cast<uint64_t>(h) * N_,
                           offKfi_ + static_cast<uint64_t>(h) * N_, false);
+        SyncAll();
     }
 
-    // ---------------- 逆变换：(scr3, scr4) -> scr7（实） ----------------
+    // ---------------- 逆变换：(scr5, scr6) -> scr9（实） ----------------
     __aicore__ inline void Inverse()
     {
         // 步骤 A'：Er = Yr@Dr + Yi@Di，Ei = Yi@Dr - Yr@Di（conj(D) = (Dr, -Di)）
-        Gemm(Scr(5), Scr(3), offDr_, 0);
-        Gemm(Scr(5), Scr(4), offDi_, 1);
-        Gemm(Scr(6), Scr(4), offDr_, 0);
-        Gemm(Scr(6), Scr(3), offDn_, 1);
+        Gemm(Scr(3), Scr(5), offDr_);
+        Gemm(Scr(4), Scr(6), offDi_);
+        SyncAll();
+        AddTo(Scr(7), Scr(3), Scr(4));
+        SyncAll();
+        Gemm(Scr(3), Scr(5), offDi_);
+        Gemm(Scr(4), Scr(6), offDr_);
+        SyncAll();
+        SubTo(Scr(8), Scr(4), Scr(3));
+        SyncAll();
         // 步骤 B'：乘共轭旋转因子
-        ComplexMulInPlace(Scr(5), Scr(6), offTr_, offTi_, true);
-        // 步骤 C'：y = (Dr@Er + Di@Ei)/N，用 DrS/DiS 把 1/N 折进常量表 [O2]
-        Gemm(Scr(7), offDrS_, Scr(5), 0);
-        Gemm(Scr(7), offDiS_, Scr(6), 1);
+        ComplexMulInPlace(Scr(7), Scr(8), offTr_, offTi_, true);
+        SyncAll();
+        // 步骤 C'：y = (Dr@Er + Di@Ei)/N（实输出 => 只取实部，2 次实数 GEMM）
+        Gemm(Scr(3), offDr_, Scr(7));
+        Gemm(Scr(4), offDi_, Scr(8));
+        SyncAll();
+        AddScaleTo(Scr(9), Scr(3), Scr(4), 1.0f / static_cast<float>(N_));
+        SyncAll();
     }
 
-    // ---------------- 输出裁剪：取线性卷积前 L 点，偏移为 0 ----------------
-    __aicore__ inline void WsToOut(uint64_t yOff, uint64_t wsOff, uint32_t count)
+    // ---------------- 输出裁剪 ----------------
+    // math 语义：y[0..L-1] = ifft[0..L-1]（因果卷积取线性卷积前 L 点，偏移为 0）
+    // corr 语义：等价于循环相关右移 K-1，输出由两段拼成
+    //            y[0..K-2]   = ifft[N-K+1..N-1]
+    //            y[K-1..L-1] = ifft[0..L-K]
+    __aicore__ inline void StoreOutput(int32_t row)
+    {
+        const uint64_t yBase = static_cast<uint64_t>(row) * L_;
+        WsToOut(yBase, Scr(9), L_);
+    }
+
+    __aicore__ inline void WsToOut(uint64_t yOff, uint64_t wsOff, int32_t count)
     {
         LocalTensor<float> a = bA_.Get<float>();
-        for (uint32_t o = 0; o < count; o += VEC_CHUNK)
+        for (int32_t o = 0; o < count; o += VEC_CHUNK)
         {
-            const uint32_t len = MinU(VEC_CHUNK, count - o);
+            const int32_t len = MinU(VEC_CHUNK, count - o);
             DataCopyExtParams cp{1, len * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
             DataCopyPadExtParams<float> pad{false, 0, 0, 0};
             DataCopyPad(a, wsGm_[wsOff + o], cp, pad);
@@ -545,9 +624,8 @@ class FftConv1dFft
 
     GlobalTensor<float> xGm_, wGm_, yGm_, wsGm_;
     TBuf<TPosition::VECCALC> bA_, bB_, bC_, bD_, bE_, bF_, bTmp_;
-    uint32_t H_, L_, K_, rows_, N_, N1_, cores_;
-    uint64_t offDr_, offDi_, offDn_, offDrS_, offDiS_, offTr_, offTi_;
-    uint64_t offKfr_, offKfi_, offScr_;
+    int32_t H_, L_, K_, rows_, N_, N1_, cores_;
+    uint64_t offDr_, offDi_, offTr_, offTi_, offKfr_, offKfi_, offScr_;
 };
 
 // ============================================================================
