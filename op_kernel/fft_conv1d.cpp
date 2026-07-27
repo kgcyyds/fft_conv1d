@@ -15,7 +15,6 @@
  * 数值路径已在 python/fft_conv1d_four_step.py 的 plan_v1 中逐步验证。
  */
 #include "kernel_operator.h"
-#include "lib/matmul_intf.h"
 
 using namespace AscendC;
 
@@ -24,7 +23,6 @@ namespace
 constexpr int32_t ALGO_DIRECT = 0;
 constexpr int32_t ALGO_FFT = 1;
 
-constexpr int32_t SCRATCH_BUFS = 10; // 与 host 侧 FFT_CONV1D_SCRATCH_BUFS 保持一致
 constexpr int32_t VEC_CHUNK = 2048;  // Vector 逐点运算的分块长度（float 个数）
 constexpr int32_t TMP_BUF_BYTES = 8192; // Cos/Sin/Fmod 需要的 sharedTmpBuffer
 constexpr float TWO_PI = 6.283185307179586f;
@@ -231,18 +229,29 @@ class FftConv1dDirect
 };
 
 // ============================================================================
-// 路径二：四步 Cooley-Tukey FFT 卷积（Cube GEMM + Vector 逐点）
+// 路径二：四步 Cooley-Tukey FFT 卷积（重写版，UB 常驻）
 // ============================================================================
+// 重写的依据（都是实测结论，不是推测）：
+//   1. DIRECT 路径正确 => DataCopyPad / Duplicate / Axpy / GetValue / GM workspace
+//      这套原语在本机是可用的。
+//   2. FFT 路径单核仍然全 0 => 与多核分片无关；与 GM 通路无关（DIRECT 用的同一块）。
+//      唯一的差异是 Matmul 高阶 API 在本 MIX 配置下没有产出。
+//   3. fp32 在 A2 上没有硬件转置（Transpose 只支持 16bit），纯 Vector 的蝶形 FFT
+//      在小 stride 上无法满足 32B 对齐 => O(N logN) 蝶形不可行，DFT-matmul 是对的算法。
+//
+// 于是这一版把 Matmul 从关键路径摘掉：矩阵乘用 Axpy 循环实现。
+//   C[i][:] = sum_k A[i][k] * B[k][:]
+// 每个 Axpy 的操作数都是整行（长度 N1），偏移是 N1 的倍数（16/32，天然 32B 对齐），
+// 与 DIRECT 路径里已验证可用的写法完全同构。
+//
+// 所有数据常驻 UB：不用 GM scratch、不用跨核共享、不需要任何 SyncAll。
+// 循环按“通道外层、batch 内层”，kernel 频谱每通道只算一次。
+//
+// 容量：12 个长度 N 的缓冲，N<=1024 时 48KB，很宽裕。
+// host 侧保证 FFT 路径只在 L+K-1 <= 1024 时选用，否则回退 DIRECT（功能不减）。
 class FftConv1dFft
 {
   public:
-    // 12 次 GEMM 形状统一为 (N1, N1, N1)，共用这一个对象
-    Matmul<MatmulType<TPosition::GM, CubeFormat::ND, float>,
-           MatmulType<TPosition::GM, CubeFormat::ND, float>,
-           MatmulType<TPosition::GM, CubeFormat::ND, float>,
-           MatmulType<TPosition::GM, CubeFormat::ND, float>>
-        mm_;
-
     __aicore__ inline FftConv1dFft()
     {
     }
@@ -251,11 +260,10 @@ class FftConv1dFft
     __aicore__ inline void Init(TPipe *pipe, GM_ADDR x, GM_ADDR w, GM_ADDR y,
                                 GM_ADDR workspace, const TILING &t)
     {
+        B_ = t.batch;
         H_ = t.channel;
         L_ = t.seqLen;
         K_ = t.kernelLen;
-        rows_ = t.totalRows;
-        // flip_ = t.flipKernel;
         N_ = t.nFft;
         N1_ = t.nRadix;
         cores_ = t.usedCoreNum;
@@ -263,452 +271,262 @@ class FftConv1dFft
         xGm_.SetGlobalBuffer((__gm__ float *)x);
         wGm_.SetGlobalBuffer((__gm__ float *)w);
         yGm_.SetGlobalBuffer((__gm__ float *)y);
-        wsGm_.SetGlobalBuffer((__gm__ float *)workspace);
 
-        // workspace 布局（float 为单位），与 host 侧一致
-        offDr_ = 0;
-        offDi_ = N_;
-        offTr_ = 2ULL * N_;
-        offTi_ = 3ULL * N_;
-        offKfr_ = 4ULL * N_;
-        offKfi_ = 4ULL * N_ + static_cast<uint64_t>(H_) * N_;
-        offScr_ = 4ULL * N_ + 2ULL * H_ * N_ +
-                  static_cast<uint64_t>(CoreIdx()) * SCRATCH_BUFS * N_;
-
-        const int32_t chunk = AlignUp8(VEC_CHUNK) * sizeof(float);
-        pipe->InitBuffer(bA_, chunk);
-        pipe->InitBuffer(bB_, chunk);
-        pipe->InitBuffer(bC_, chunk);
-        pipe->InitBuffer(bD_, chunk);
-        pipe->InitBuffer(bE_, chunk);
-        pipe->InitBuffer(bF_, chunk);
+        const int32_t bytes = N_ * sizeof(float);
+        pipe->InitBuffer(bDr_, bytes);
+        pipe->InitBuffer(bDi_, bytes);
+        pipe->InitBuffer(bTr_, bytes);
+        pipe->InitBuffer(bTi_, bytes);
+        pipe->InitBuffer(bKr_, bytes);
+        pipe->InitBuffer(bKi_, bytes);
+        pipe->InitBuffer(bXr_, bytes);
+        pipe->InitBuffer(bXi_, bytes);
+        pipe->InitBuffer(bYr_, bytes);
+        pipe->InitBuffer(bYi_, bytes);
+        pipe->InitBuffer(bZr_, bytes);
+        pipe->InitBuffer(bZi_, bytes);
         pipe->InitBuffer(bTmp_, TMP_BUF_BYTES);
     }
 
     __aicore__ inline void Process()
     {
         BuildTables();
-        SyncAll();
 
-        // 阶段 1：每个通道的 kernel 频谱（写入 workspace，供所有 batch 复用）
-        const int32_t chPerCore = (H_ + cores_ - 1) / cores_;
-        for (int32_t i = 0; i < chPerCore; ++i)
+        // 按通道切核：每个核完整拥有若干通道，核之间零共享，因此不需要任何同步。
+        // kernel 频谱在通道循环体内只算一次，被该通道的全部 batch 复用。
+        for (int32_t h = CoreIdx(); h < H_; h += cores_)
         {
-            const int32_t h = CoreIdx() + i * cores_;
-            const bool active = (h < H_);
-            PrepareKernelRow(active ? h : 0, active);
-            Forward(); // scr0 -> (scr5, scr6)
-            if (active)
-            {
-                CopyRange(offKfr_ + static_cast<uint64_t>(h) * N_, Scr(5), N_);
-                CopyRange(offKfi_ + static_cast<uint64_t>(h) * N_, Scr(6), N_);
-            }
-            SyncAll();
-        }
+            LoadToX(wGm_, static_cast<uint64_t>(h) * K_, K_); // Xr = [kernel 行, 0...]
+            Forward();                                        // -> (Xr, Xi)
+            CopyBuf(bKr_.Get<float>(), bXr_.Get<float>());
+            CopyBuf(bKi_.Get<float>(), bXi_.Get<float>());
 
-        // 阶段 2：逐行做 FFT 卷积
-        const int32_t rowsPerCore = (rows_ + cores_ - 1) / cores_;
-        for (int32_t i = 0; i < rowsPerCore; ++i)
-        {
-            const int32_t row = CoreIdx() + i * cores_;
-            const bool active = (row < rows_);
-            PrepareDataRow(active ? row : 0, active);
-            Forward();                       // scr0 -> (scr5, scr6)
-            PointwiseWithKernel(active ? (row % H_) : 0);
-            Inverse();                       // (scr5,scr6) -> scr9
-            if (active)
+            for (int32_t b = 0; b < B_; ++b)
             {
-                StoreOutput(row);
+                const int32_t row = b * H_ + h; // input 布局 [B,H,L]
+                LoadToX(xGm_, static_cast<uint64_t>(row) * L_, L_);
+                Forward();
+                // 频域逐点复乘 (Xr,Xi) *= (Kr,Ki)
+                CMul(bXr_.Get<float>(), bXi_.Get<float>(),
+                     bKr_.Get<float>(), bKi_.Get<float>(), false);
+                Inverse();  // (Xr,Xi) -> Xr（实数时域）
+                StoreFromX(static_cast<uint64_t>(row) * L_);
             }
-            SyncAll();
         }
     }
 
   private:
-    __aicore__ inline uint64_t Scr(int32_t idx) const
-    {
-        return offScr_ + static_cast<uint64_t>(idx) * N_;
-    }
-
-    // ---------------- 常量表生成 ----------------
-    // D[k][n] = exp(-2πi·((k·n) mod N1)/N1)，k,n ∈ [0,N1)
-    // T[k1][n2] = exp(-2πi·((k1·n2) mod N)/N)，存放在 k1*N1 + n2
-    //
-    // 必须"先做整数乘再取模"：浮点乘法不满足结合律，若写成 (-2π·k)·n/M 会让
-    // 本应对称的 DFT 矩阵出现 ~1e-14 不对称，破坏"D 对称所以不用转置"的前提；
-    // 取模同时把角度压回 [-2π,0)，避免大幅角三角函数的规约误差。
-    // （这个坑是在 python 原型阶段实测踩到并修掉的）
+    // ------------------------------------------------------------------
+    // 常量表：D[k][n] = exp(-2πi*((k*n) mod N1)/N1)，T[k1][n2] = exp(-2πi*((k1*n2) mod N)/N)
+    // 必须先做整数乘再取模：浮点乘不满足结合律，写成 (-2π*k)*n/M 会破坏 D 的对称性
+    // （“D 对称所以不用转置”是本方案成立的前提），取模还能避免大幅角的规约误差。
+    // ------------------------------------------------------------------
     __aicore__ inline void BuildTables()
     {
-        LocalTensor<float> idx = bA_.Get<float>();
-        LocalTensor<float> prod = bB_.Get<float>();
-        LocalTensor<float> modv = bC_.Get<float>();
-        LocalTensor<float> ang = bD_.Get<float>();
-        LocalTensor<float> re = bE_.Get<float>();
-        LocalTensor<float> im = bF_.Get<float>();
+        LocalTensor<float> dr = bDr_.Get<float>();
+        LocalTensor<float> di = bDi_.Get<float>();
+        LocalTensor<float> tr = bTr_.Get<float>();
+        LocalTensor<float> ti = bTi_.Get<float>();
+        LocalTensor<float> idx = bZr_.Get<float>();   // 借用工作缓冲
+        LocalTensor<float> modv = bZi_.Get<float>();
         LocalTensor<uint8_t> tmp = bTmp_.Get<uint8_t>();
 
-        const int32_t len = AlignUp8(N1_);
-        CreateVecIndex(idx, 0.0f, len); // idx[n] = n
+        CreateVecIndex(idx, 0.0f, N1_); // idx[n] = n
         PipeBarrier<PIPE_V>();
 
-        for (int32_t k = CoreIdx(); k < N1_; k += cores_)
+        for (int32_t k = 0; k < N1_; ++k)
         {
-            // ---- D 的第 k 行，模 N1 ----
-            EmitRow(idx, prod, modv, ang, re, im, tmp, len, k,
-                    static_cast<float>(N1_), offDr_ + static_cast<uint64_t>(k) * N1_,
-                    offDi_ + static_cast<uint64_t>(k) * N1_);
-            // ---- T 的第 k 行，模 N ----
-            EmitRow(idx, prod, modv, ang, re, im, tmp, len, k,
-                    static_cast<float>(N_), offTr_ + static_cast<uint64_t>(k) * N1_,
-                    offTi_ + static_cast<uint64_t>(k) * N1_);
+            EmitRow(dr[k * N1_], di[k * N1_], idx, modv, tmp, k, static_cast<float>(N1_));
+            EmitRow(tr[k * N1_], ti[k * N1_], idx, modv, tmp, k, static_cast<float>(N_));
         }
+        // 后面要用 GetValue 从标量单元读这些表，必须等 Vector 写完
+        SetFlag<HardEvent::V_S>(EVENT_ID0);
+        WaitFlag<HardEvent::V_S>(EVENT_ID0);
     }
 
-    __aicore__ inline void EmitRow(const LocalTensor<float> &idx, const LocalTensor<float> &prod,
-                                   const LocalTensor<float> &modv, const LocalTensor<float> &ang,
-                                   const LocalTensor<float> &re, const LocalTensor<float> &im,
-                                   const LocalTensor<uint8_t> &tmp, int32_t len, int32_t k,
-                                   float mod, uint64_t offR, uint64_t offI)
+    __aicore__ inline void EmitRow(const LocalTensor<float> &re, const LocalTensor<float> &im,
+                                   const LocalTensor<float> &idx, const LocalTensor<float> &modv,
+                                   const LocalTensor<uint8_t> &tmp, int32_t k, float mod)
     {
-        Muls(prod, idx, static_cast<float>(k), len); // prod = k*n（整数，fp32 精确表示）
+        Muls(re, idx, static_cast<float>(k), N1_); // k*n（整数，fp32 精确）
         PipeBarrier<PIPE_V>();
-        Duplicate(modv, mod, len);
+        Duplicate(modv, mod, N1_);
         PipeBarrier<PIPE_V>();
-        Fmod(prod, prod, modv, tmp, len); // prod = (k*n) mod M ∈ [0, M)
+        Fmod(re, re, modv, tmp, N1_); // (k*n) mod M ∈ [0, M)
         PipeBarrier<PIPE_V>();
-        Muls(ang, prod, -TWO_PI / mod, len); // 角度落在 (-2π, 0]
+        Muls(re, re, -TWO_PI / mod, N1_); // 角度落在 (-2π, 0]
         PipeBarrier<PIPE_V>();
-        Cos(re, ang, tmp, len);
-        Sin(im, ang, tmp, len);
+        Sin(im, re, tmp, N1_);
         PipeBarrier<PIPE_V>();
-        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        DataCopyExtParams cp{1, N1_ * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
-        DataCopyPad(wsGm_[offR], re, cp);
-        DataCopyPad(wsGm_[offI], im, cp);
-        SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+        Cos(re, re, tmp, N1_); // 注意先算 sin 再就地覆盖成 cos
+        PipeBarrier<PIPE_V>();
     }
 
-    // ---------------- 输入准备 ----------------
-    // scr0 = [行数据, 0, ..., 0]，长度 N
-    __aicore__ inline void FillZero(uint64_t off, int32_t count)
+    // ------------------------------------------------------------------
+    // UB 内的 [N1,N1] 矩阵乘：C = A @ B，用 Axpy 逐行累加
+    // C[i][:] = sum_k A[i][k] * B[k][:]
+    // 每次 Axpy 处理一整行（N1 个 float），偏移 i*N1 / k*N1 都是 N1 的倍数，
+    // N1 ∈ {16,32} 均为 8 的倍数 => 首地址天然 32B 对齐。
+    // ------------------------------------------------------------------
+    __aicore__ inline void MatMulUB(const LocalTensor<float> &c, const LocalTensor<float> &a,
+                                    const LocalTensor<float> &b)
     {
-        LocalTensor<float> z = bA_.Get<float>();
-        Duplicate(z, 0.0f, AlignUp8(VEC_CHUNK));
-        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        for (int32_t o = 0; o < count; o += VEC_CHUNK)
+        // a 由上一步的 Vector 运算写出，标量单元读它之前必须同步
+        SetFlag<HardEvent::V_S>(EVENT_ID0);
+        WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        for (int32_t i = 0; i < N1_; ++i)
         {
-            const int32_t len = MinU(VEC_CHUNK, count - o);
-            DataCopyExtParams cp{1, len * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
-            DataCopyPad(wsGm_[off + o], z, cp);
-        }
-        SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
-    }
-
-    __aicore__ inline void GmToGm(uint64_t dstOff, const GlobalTensor<float> &src,
-                                  uint64_t srcOff, int32_t count)
-    {
-        LocalTensor<float> b = bA_.Get<float>();
-        for (int32_t o = 0; o < count; o += VEC_CHUNK)
-        {
-            const int32_t len = MinU(VEC_CHUNK, count - o);
-            DataCopyExtParams cp{1, len * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
-            DataCopyPadExtParams<float> pad{false, 0, 0, 0};
-            DataCopyPad(b, src[srcOff + o], cp, pad);
-            SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-            WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-            DataCopyPad(wsGm_[dstOff + o], b, cp);
-            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-        }
-    }
-
-    __aicore__ inline void PrepareKernelRow(int32_t h, bool active)
-    {
-        FillZero(Scr(0), N_);
-        if (active)
-        {
-            // flip_ 语义不在这里做翻转：改用 conj(K̂) + 输出循环移位，见 Process()
-            GmToGm(Scr(0), wGm_, static_cast<uint64_t>(h) * K_, K_);
-        }
-    }
-
-    __aicore__ inline void PrepareDataRow(int32_t row, bool active)
-    {
-        FillZero(Scr(0), N_);
-        if (active)
-        {
-            GmToGm(Scr(0), xGm_, static_cast<uint64_t>(row) * L_, L_);
-        }
-    }
-
-    // ---------------- GEMM 封装 ----------------
-    __aicore__ inline void Gemm(uint64_t oC, uint64_t oA, uint64_t oB)
-    {
-        mm_.SetTensorA(wsGm_[oA]);
-        mm_.SetTensorB(wsGm_[oB]);
-        mm_.IterateAll(wsGm_[oC]);
-        mm_.End();
-    }
-
-    // ---------------- Vector 逐点运算（全部经 UB 分块）----------------
-    // dst = a + b
-    __aicore__ inline void AddTo(uint64_t oDst, uint64_t oA, uint64_t oB)
-    {
-        BinaryOp(oDst, oA, oB, 0);
-    }
-    // dst = a - b
-    __aicore__ inline void SubTo(uint64_t oDst, uint64_t oA, uint64_t oB)
-    {
-        BinaryOp(oDst, oA, oB, 1);
-    }
-
-    __aicore__ inline void BinaryOp(uint64_t oDst, uint64_t oA, uint64_t oB, int32_t kind)
-    {
-        LocalTensor<float> a = bA_.Get<float>();
-        LocalTensor<float> b = bB_.Get<float>();
-        LocalTensor<float> c = bC_.Get<float>();
-        for (int32_t o = 0; o < N_; o += VEC_CHUNK)
-        {
-            const int32_t len = MinU(VEC_CHUNK, N_ - o);
-            LoadTwo(a, b, oA + o, oB + o, len);
-            if (kind == 0)
+            Duplicate(c[i * N1_], 0.0f, N1_);
+            PipeBarrier<PIPE_V>();
+            for (int32_t k = 0; k < N1_; ++k)
             {
-                Add(c, a, b, len);
+                Axpy(c[i * N1_], b[k * N1_], a.GetValue(i * N1_ + k), N1_);
             }
-            else
-            {
-                Sub(c, a, b, len);
-            }
-            StoreOne(c, oDst + o, len);
+            PipeBarrier<PIPE_V>();
         }
     }
 
-    // dst = (a + b) * s
-    __aicore__ inline void AddScaleTo(uint64_t oDst, uint64_t oA, uint64_t oB, float s)
+    // (ar,ai) *= (br,bi)，conjB 时用 (br,-bi)。4 次实乘，数值最稳。
+    __aicore__ inline void CMul(const LocalTensor<float> &ar, const LocalTensor<float> &ai,
+                                const LocalTensor<float> &br, const LocalTensor<float> &bi,
+                                bool conjB)
     {
-        LocalTensor<float> a = bA_.Get<float>();
-        LocalTensor<float> b = bB_.Get<float>();
-        LocalTensor<float> c = bC_.Get<float>();
-        for (int32_t o = 0; o < N_; o += VEC_CHUNK)
+        LocalTensor<float> t0 = bZr_.Get<float>();
+        LocalTensor<float> t1 = bZi_.Get<float>();
+        Mul(t0, ar, br, N_); // ar*br
+        Mul(t1, ai, bi, N_); // ai*bi
+        PipeBarrier<PIPE_V>();
+        if (conjB)
         {
-            const int32_t len = MinU(VEC_CHUNK, N_ - o);
-            LoadTwo(a, b, oA + o, oB + o, len);
-            Add(c, a, b, len);
-            PipeBarrier<PIPE_V>();
-            Muls(c, c, s, len);
-            StoreOne(c, oDst + o, len);
+            Add(t0, t0, t1, N_); // conj: 实部 = ar*br + ai*bi
         }
-    }
-
-    __aicore__ inline void CopyRange(uint64_t oDst, uint64_t oSrc, int32_t count)
-    {
-        LocalTensor<float> a = bA_.Get<float>();
-        for (int32_t o = 0; o < count; o += VEC_CHUNK)
+        else
         {
-            const int32_t len = MinU(VEC_CHUNK, count - o);
-            LoadOne(a, oSrc + o, len);
-            StoreOne(a, oDst + o, len);
+            Sub(t0, t0, t1, N_); // 实部 = ar*br - ai*bi
         }
-    }
-
-    __aicore__ inline void NegRange(uint64_t oDst, uint64_t oSrc, int32_t count)
-    {
-        LocalTensor<float> a = bA_.Get<float>();
-        for (int32_t o = 0; o < count; o += VEC_CHUNK)
+        PipeBarrier<PIPE_V>();
+        Mul(t1, ar, bi, N_); // ar*bi
+        PipeBarrier<PIPE_V>();
+        Mul(ar, ai, br, N_); // ai*br（ar 此时已不再需要，安全复用）
+        PipeBarrier<PIPE_V>();
+        if (conjB)
         {
-            const int32_t len = MinU(VEC_CHUNK, count - o);
-            LoadOne(a, oSrc + o, len);
-            Muls(a, a, -1.0f, len);
-            StoreOne(a, oDst + o, len);
+            Sub(ai, ar, t1, N_); // conj: 虚部 = ai*br - ar*bi
         }
-    }
-
-    // (ar, ai) = (ar, ai) * (br, bi)，conjB 时用 (br, -bi)。4 次实乘，见设计文档 §6.4
-    __aicore__ inline void ComplexMulInPlace(uint64_t oAr, uint64_t oAi, uint64_t oBr,
-                                             uint64_t oBi, bool conjB)
-    {
-        LocalTensor<float> ar = bA_.Get<float>();
-        LocalTensor<float> ai = bB_.Get<float>();
-        LocalTensor<float> br = bC_.Get<float>();
-        LocalTensor<float> bi = bD_.Get<float>();
-        LocalTensor<float> tr = bE_.Get<float>();
-        LocalTensor<float> ti = bF_.Get<float>();
-
-        for (int32_t o = 0; o < N_; o += VEC_CHUNK)
+        else
         {
-            const int32_t len = MinU(VEC_CHUNK, N_ - o);
-            LoadTwo(ar, ai, oAr + o, oAi + o, len);
-            LoadTwo(br, bi, oBr + o, oBi + o, len);
-            if (conjB)
-            {
-                Muls(bi, bi, -1.0f, len);
-                PipeBarrier<PIPE_V>();
-            }
-            // 实部：ar*br - ai*bi
-            Mul(tr, ar, br, len);
-            Mul(ti, ai, bi, len);
-            PipeBarrier<PIPE_V>();
-            Sub(tr, tr, ti, len);
-            PipeBarrier<PIPE_V>();
-            // 虚部：ar*bi + ai*br（ar 在算完 ar*bi 后即失效，可安全复用为临时量）
-            Mul(ti, ar, bi, len);
-            PipeBarrier<PIPE_V>();
-            Mul(ar, ai, br, len);
-            PipeBarrier<PIPE_V>();
-            Add(ti, ti, ar, len);
-            StoreOne(tr, oAr + o, len);
-            StoreOne(ti, oAi + o, len);
+            Add(ai, ar, t1, N_); // 虚部 = ar*bi + ai*br
         }
+        PipeBarrier<PIPE_V>();
+        CopyBuf(ar, t0);
     }
 
-    __aicore__ inline void LoadOne(const LocalTensor<float> &d, uint64_t off, int32_t len)
+    __aicore__ inline void CopyBuf(const LocalTensor<float> &dst, const LocalTensor<float> &src)
     {
-        DataCopyExtParams cp{1, len * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
-        DataCopyPadExtParams<float> pad{false, 0, 0, 0};
-        DataCopyPad(d, wsGm_[off], cp, pad);
-        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        Adds(dst, src, 0.0f, N_); // UB->UB 拷贝，用 Adds 最省事
+        PipeBarrier<PIPE_V>();
     }
 
-    __aicore__ inline void LoadTwo(const LocalTensor<float> &d0, const LocalTensor<float> &d1,
-                                   uint64_t o0, uint64_t o1, int32_t len)
-    {
-        DataCopyExtParams cp{1, len * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
-        DataCopyPadExtParams<float> pad{false, 0, 0, 0};
-        DataCopyPad(d0, wsGm_[o0], cp, pad);
-        DataCopyPad(d1, wsGm_[o1], cp, pad);
-        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-    }
-
-    __aicore__ inline void StoreOne(const LocalTensor<float> &s, uint64_t off, int32_t len)
-    {
-        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        DataCopyExtParams cp{1, len * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
-        DataCopyPad(wsGm_[off], s, cp);
-        SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
-    }
-
-    // ---------------- 正变换：scr0（实，已补零）-> (scr5, scr6) ----------------
+    // ------------------------------------------------------------------
+    // 正变换：(Xr) 实数时域 -> (Xr, Xi) 频域（[k1][k2] 置换序，与逆变换自洽）
+    // ------------------------------------------------------------------
     __aicore__ inline void Forward()
     {
-        // 步骤 A：Br = Dr @ xmat, Bi = Di @ xmat（实输入 => 只要 2 次实数 GEMM）
-        Gemm(Scr(1), offDr_, Scr(0));
-        Gemm(Scr(2), offDi_, Scr(0));
-        CubeVecSync();
-        // 步骤 B：乘旋转因子 W_N^{k1·n2}
-        ComplexMulInPlace(Scr(1), Scr(2), offTr_, offTi_, false);
-        CubeVecSync();
-        // 步骤 C：Cr = Br@D - Bi@Di，Ci = Br@Di + Bi@Dr（D 对称，无需转置）
-        Gemm(Scr(3), Scr(1), offDr_);
-        Gemm(Scr(4), Scr(2), offDi_);
-        CubeVecSync();
-        SubTo(Scr(5), Scr(3), Scr(4));
-        CubeVecSync();
-        Gemm(Scr(3), Scr(1), offDi_);
-        Gemm(Scr(4), Scr(2), offDr_);
-        CubeVecSync();
-        AddTo(Scr(6), Scr(3), Scr(4));
-        CubeVecSync();
+        LocalTensor<float> dr = bDr_.Get<float>();
+        LocalTensor<float> di = bDi_.Get<float>();
+        LocalTensor<float> xr = bXr_.Get<float>();
+        LocalTensor<float> xi = bXi_.Get<float>();
+        LocalTensor<float> yr = bYr_.Get<float>();
+        LocalTensor<float> yi = bYi_.Get<float>();
+        LocalTensor<float> zr = bZr_.Get<float>();
+        LocalTensor<float> zi = bZi_.Get<float>();
+
+        // 步骤 A：Br = Dr @ X，Bi = Di @ X（实输入，只需 2 次实矩阵乘）
+        MatMulUB(yr, dr, xr);
+        MatMulUB(yi, di, xr);
+        // 步骤 B：乘旋转因子
+        CMul(yr, yi, bTr_.Get<float>(), bTi_.Get<float>(), false);
+        // 步骤 C：Cr = Br@Dr - Bi@Di，Ci = Br@Di + Bi@Dr（D 对称，无需转置）
+        MatMulUB(zr, yr, dr);
+        MatMulUB(zi, yi, di);
+        Sub(xr, zr, zi, N_);
+        PipeBarrier<PIPE_V>();
+        MatMulUB(zr, yr, di);
+        MatMulUB(zi, yi, dr);
+        Add(xi, zr, zi, N_);
+        PipeBarrier<PIPE_V>();
     }
 
-    // ---------------- 频域逐点乘 ----------------
-    __aicore__ inline void PointwiseWithKernel(int32_t h)
-    {
-        ComplexMulInPlace(Scr(5), Scr(6), offKfr_ + static_cast<uint64_t>(h) * N_,
-                          offKfi_ + static_cast<uint64_t>(h) * N_, false);
-        CubeVecSync();
-    }
-
-    // ---------------- 逆变换：(scr5, scr6) -> scr9（实） ----------------
+    // ------------------------------------------------------------------
+    // 逆变换：(Xr, Xi) -> Xr（实数时域，已含 1/N 归一化）
+    // ------------------------------------------------------------------
     __aicore__ inline void Inverse()
     {
+        LocalTensor<float> dr = bDr_.Get<float>();
+        LocalTensor<float> di = bDi_.Get<float>();
+        LocalTensor<float> xr = bXr_.Get<float>();
+        LocalTensor<float> xi = bXi_.Get<float>();
+        LocalTensor<float> yr = bYr_.Get<float>();
+        LocalTensor<float> yi = bYi_.Get<float>();
+        LocalTensor<float> zr = bZr_.Get<float>();
+        LocalTensor<float> zi = bZi_.Get<float>();
+
         // 步骤 A'：Er = Yr@Dr + Yi@Di，Ei = Yi@Dr - Yr@Di（conj(D) = (Dr, -Di)）
-        Gemm(Scr(3), Scr(5), offDr_);
-        Gemm(Scr(4), Scr(6), offDi_);
-        CubeVecSync();
-        AddTo(Scr(7), Scr(3), Scr(4));
-        CubeVecSync();
-        Gemm(Scr(3), Scr(5), offDi_);
-        Gemm(Scr(4), Scr(6), offDr_);
-        CubeVecSync();
-        SubTo(Scr(8), Scr(4), Scr(3));
-        CubeVecSync();
+        MatMulUB(zr, xr, dr);
+        MatMulUB(zi, xi, di);
+        Add(yr, zr, zi, N_);
+        PipeBarrier<PIPE_V>();
+        MatMulUB(zr, xr, di);
+        MatMulUB(zi, xi, dr);
+        Sub(yi, zi, zr, N_);
+        PipeBarrier<PIPE_V>();
         // 步骤 B'：乘共轭旋转因子
-        ComplexMulInPlace(Scr(7), Scr(8), offTr_, offTi_, true);
-        CubeVecSync();
-        // 步骤 C'：y = (Dr@Er + Di@Ei)/N（实输出 => 只取实部，2 次实数 GEMM）
-        Gemm(Scr(3), offDr_, Scr(7));
-        Gemm(Scr(4), offDi_, Scr(8));
-        CubeVecSync();
-        AddScaleTo(Scr(9), Scr(3), Scr(4), 1.0f / static_cast<float>(N_));
-        CubeVecSync();
+        CMul(yr, yi, bTr_.Get<float>(), bTi_.Get<float>(), true);
+        // 步骤 C'：y = (Dr@Er + Di@Ei)/N（实输出，只取实部）
+        MatMulUB(zr, dr, yr);
+        MatMulUB(zi, di, yi);
+        Add(xr, zr, zi, N_);
+        PipeBarrier<PIPE_V>();
+        Muls(xr, xr, 1.0f / static_cast<float>(N_), N_);
+        PipeBarrier<PIPE_V>();
     }
 
-    // ---------------- 输出裁剪 ----------------
-    // math 语义：y[0..L-1] = ifft[0..L-1]（因果卷积取线性卷积前 L 点，偏移为 0）
-    // corr 语义：等价于循环相关右移 K-1，输出由两段拼成
-    //            y[0..K-2]   = ifft[N-K+1..N-1]
-    //            y[K-1..L-1] = ifft[0..L-K]
-    __aicore__ inline void StoreOutput(int32_t row)
+    // ------------------------------------------------------------------
+    // GM <-> UB
+    // ------------------------------------------------------------------
+    // Xr = [src 的 count 个元素, 0 补齐到 N]；Xi 清零
+    __aicore__ inline void LoadToX(const GlobalTensor<float> &src, uint64_t off, int32_t count)
     {
-        const uint64_t yBase = static_cast<uint64_t>(row) * L_;
-        uint64_t src = Scr(9);
-        if (DEBUG_DUMP_STAGE == 1)
-        {
-            src = offDr_;
-        }
-        else if (DEBUG_DUMP_STAGE == 2)
-        {
-            src = offTr_;
-        }
-        else if (DEBUG_DUMP_STAGE == 3)
-        {
-            src = Scr(0);
-        }
-        else if (DEBUG_DUMP_STAGE == 4)
-        {
-            src = Scr(1);
-        }
-        else if (DEBUG_DUMP_STAGE == 5)
-        {
-            src = Scr(5);
-        }
-        else if (DEBUG_DUMP_STAGE == 6)
-        {
-            src = offKfr_ + static_cast<uint64_t>(row % H_) * N_;
-        }
-        WsToOut(yBase, src, L_);
+        LocalTensor<float> xr = bXr_.Get<float>();
+        Duplicate(xr, 0.0f, N_);
+        PipeBarrier<PIPE_V>();
+        SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
+        WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
+        DataCopyExtParams cp{1, static_cast<uint32_t>(count) * static_cast<uint32_t>(sizeof(float)),
+                             0, 0, 0};
+        DataCopyPadExtParams<float> pad{false, 0, 0, 0};
+        DataCopyPad(xr, src[off], cp, pad);
+        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
     }
 
-    __aicore__ inline void WsToOut(uint64_t yOff, uint64_t wsOff, int32_t count)
+    // 因果卷积取线性卷积的前 L 个点，偏移为 0（推导见 docs/01 §5）
+    __aicore__ inline void StoreFromX(uint64_t off)
     {
-        LocalTensor<float> a = bA_.Get<float>();
-        for (int32_t o = 0; o < count; o += VEC_CHUNK)
-        {
-            const int32_t len = MinU(VEC_CHUNK, count - o);
-            DataCopyExtParams cp{1, len * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
-            DataCopyPadExtParams<float> pad{false, 0, 0, 0};
-            DataCopyPad(a, wsGm_[wsOff + o], cp, pad);
-            SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-            WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-            DataCopyPad(yGm_[yOff + o], a, cp);
-            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-        }
+        LocalTensor<float> xr = bXr_.Get<float>();
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        DataCopyExtParams cp{1, static_cast<uint32_t>(L_) * static_cast<uint32_t>(sizeof(float)),
+                             0, 0, 0};
+        DataCopyPad(yGm_[off], xr, cp);
+        SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     }
 
-    GlobalTensor<float> xGm_, wGm_, yGm_, wsGm_;
-    TBuf<TPosition::VECCALC> bA_, bB_, bC_, bD_, bE_, bF_, bTmp_;
-    int32_t H_, L_, K_, rows_, N_, N1_, cores_;
-    uint64_t offDr_, offDi_, offTr_, offTi_, offKfr_, offKfi_, offScr_;
+    GlobalTensor<float> xGm_, wGm_, yGm_;
+    TBuf<TPosition::VECCALC> bDr_, bDi_, bTr_, bTi_, bKr_, bKi_;
+    TBuf<TPosition::VECCALC> bXr_, bXi_, bYr_, bYi_, bZr_, bZi_, bTmp_;
+    int32_t B_, H_, L_, K_, N_, N1_, cores_;
 };
 
 // ============================================================================
@@ -718,7 +536,8 @@ extern "C" __global__ __aicore__ void fft_conv1d(GM_ADDR x, GM_ADDR kernel, GM_A
                                                  GM_ADDR workspace, GM_ADDR tiling)
 {
     GET_TILING_DATA(tilingData, tiling);
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    // 重写后两条路径都是纯 Vector 实现，不再需要 MIX（Cube）模式
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
 
     TPipe pipe;
     if (tilingData.algo == ALGO_DIRECT)
@@ -730,7 +549,6 @@ extern "C" __global__ __aicore__ void fft_conv1d(GM_ADDR x, GM_ADDR kernel, GM_A
     else
     {
         FftConv1dFft op;
-        REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), op.mm_, &tilingData.cubeTiling);
         op.Init(&pipe, x, kernel, y, workspace, tilingData);
         op.Process();
     }

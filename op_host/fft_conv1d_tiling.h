@@ -25,13 +25,14 @@ constexpr uint32_t FFT_CONV1D_ALGO_FFT = 1;    // 四步 Cooley-Tukey（Cube + V
 constexpr uint32_t FFT_CONV1D_FORCE_SINGLE_CORE = 1;
 
 // v1 约束（同时写入 host 校验与文档，不做隐式假设）
-constexpr uint32_t FFT_CONV1D_MAX_NFFT = 16384;  // N_fft 上限 => N1 = 128
+// FFT 路径 N_fft 上限。重写版把中间结果全部放 UB：12 个长度 N 的缓冲，
+// N=1024 时 48KB（很宽裕），N=4096 时 192KB（放不下）。故上限取 1024。
+// 超出时 host 自动回退 DIRECT —— DIRECT 对任意 K 数值都正确，功能覆盖不减。
+constexpr uint32_t FFT_CONV1D_MAX_NFFT = 1024;   // => N1 = N2 = 32
 constexpr uint32_t FFT_CONV1D_FFT_MIN_K = 64;    // K 小于该值走 direct（见设计文档 §9）
 constexpr uint32_t FFT_CONV1D_DIRECT_TILE = 4096; // direct 路径的输出分块长度
 
-// FFT 路径每个核需要的 scratch 缓冲个数（每个长度 N_fft，float32）
-// 0:xmat 1:br 2:bi 3:t0 4:t1 5:cr 6:ci 7:er 8:ei 9:yout
-constexpr uint32_t FFT_CONV1D_SCRATCH_BUFS = 10;
+// 重写后 FFT 路径全部数据常驻 UB，不再需要 GM scratch
 
 BEGIN_TILING_DATA_DEF(FftConv1dTilingData)
 TILING_DATA_FIELD_DEF(uint32_t, batch);      // B
@@ -46,7 +47,6 @@ TILING_DATA_FIELD_DEF(uint32_t, nRadix);     // N1 = N2 = sqrt(N)
 TILING_DATA_FIELD_DEF(uint32_t, usedCoreNum);
 TILING_DATA_FIELD_DEF(uint32_t, tileLen);    // direct 路径输出分块长度
 TILING_DATA_FIELD_DEF(uint32_t, rowsPerCore);
-TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, cubeTiling);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(FftConv1d, FftConv1dTilingData)

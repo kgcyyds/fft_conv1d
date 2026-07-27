@@ -5,17 +5,14 @@
  *   output[b,h,t] = sum_{j=0}^{K-1} input[b,h,t-j] * kernel[h,j],  t-j<0 时 input 视为 0
  *   即因果 depthwise 卷积，每个通道独立，不做通道间求和。
  *
- * 属性 flip_kernel：
- *   0（默认）= math 语义，与上式一致
- *   1        = corr 语义，等价于把 kernel 时域翻转，用于复现
- *              F.conv1d(F.pad(x,(K-1,0)), kernel.unsqueeze(1), groups=H) 的行为
+ * 注意：这是数学意义的卷积，不是 cross-correlation。
  */
+#include <cstdio>
+
 #include "fft_conv1d_tiling.h"
 #include "register/op_def_registry.h"
 #include "tiling/platform/platform_ascendc.h"
-#include "tiling/tiling_api.h"
 
-using namespace matmul_tiling;
 
 namespace
 {
@@ -86,80 +83,56 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     {
         return ge::GRAPH_FAILED; // v1 约束：K <= L
     }
-    // v1 约束：线性卷积长度不得超过 N_fft 上限
-    if (L + K - 1 > FFT_CONV1D_MAX_NFFT)
-    {
-        return ge::GRAPH_FAILED;
-    }
 
-    // // ---------------- 2. 属性 ----------------
-    // uint32_t flipKernel = 0;
-    // auto attrs = context->GetAttrs();
-    // if (attrs != nullptr && attrs->GetAttrNum() > 0)
-    // {
-    //     const int64_t *p = attrs->GetAttrPointer<int64_t>(0);
-    //     if (p != nullptr)
-    //     {
-    //         flipKernel = (*p != 0) ? 1U : 0U;
-    //     }
-    // }
-
-    // ---------------- 3. FFT 长度与分解 ----------------
-    // v1 取 N 为 4 的幂 => N1 = N2 = sqrt(N)，D1 与 D2 是同一个矩阵，
-    // 且四步分解中 12 次 GEMM 形状统一为 (N1, N1, N1)，共用一套 TCubeTiling。
-    // 取舍理由见 docs/03_ascendc_v1.md §2。
+    // ---------------- 2. FFT 长度与分解 ----------------
+    // N 取 4 的幂 => N1 = N2 = sqrt(N)，D1 与 D2 是同一个矩阵。
     const uint32_t need = (L + K - 1) < 2 ? 2 : (L + K - 1);
     const uint32_t nFft = NextPow4(need);
     const uint32_t nRadix = IsqrtPow4(nFft);
 
-    // ---------------- 4. 算法分派 ----------------
-    // K 较小时 direct 更快（分界点分析见 docs/02_algorithm_design.md §9）
-    const uint32_t algo = (K < FFT_CONV1D_FFT_MIN_K) ? FFT_CONV1D_ALGO_DIRECT
-                                                     : FFT_CONV1D_ALGO_FFT;
+    // ---------------- 3. 算法分派 ----------------
+    // FFT 需同时满足：K 足够大（否则 direct 更快）且 N_fft 不超过 UB 容量上限。
+    // 任一不满足就走 DIRECT —— DIRECT 对任意 shape 都数值正确，只是更慢，
+    // 因此算子支持的 shape 范围不因这个上限而缩小。
+    const bool useFft = (K >= FFT_CONV1D_FFT_MIN_K) && (need <= FFT_CONV1D_MAX_NFFT);
+    const uint32_t algo = useFft ? FFT_CONV1D_ALGO_FFT : FFT_CONV1D_ALGO_DIRECT;
 
-    // ---------------- 5. 多核切分：按 R = B*H 行切 ----------------
+    // ---------------- 4. 多核切分 ----------------
+    // FFT 按通道切（每核独占若干通道，kernel 频谱每通道只算一次）；
+    // DIRECT 按行切。两者都无跨核共享，不需要任何同步。
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    uint32_t aicNum = ascendcPlatform.GetCoreNumAic();
-    if (aicNum == 0)
+    uint32_t coreNum = ascendcPlatform.GetCoreNumAiv();
+    if (coreNum == 0)
     {
-        aicNum = 1;
+        coreNum = 1;
     }
     const uint32_t totalRows = B * H;
-    uint32_t usedCoreNum = (totalRows < aicNum) ? totalRows : aicNum;
+    const uint32_t splitUnit = (algo == FFT_CONV1D_ALGO_FFT) ? H : totalRows;
+    uint32_t usedCoreNum = (splitUnit < coreNum) ? splitUnit : coreNum;
     if (usedCoreNum == 0)
     {
         usedCoreNum = 1;
     }
-    // 调试期强制单核，排除多核相关因素（见 fft_conv1d_tiling.h 的开关说明）
     if (FFT_CONV1D_FORCE_SINGLE_CORE != 0)
     {
-        usedCoreNum = 1;
+        usedCoreNum = 1; // 调试期强制单核
     }
     const uint32_t rowsPerCore = CeilDiv(totalRows, usedCoreNum);
 
-    // direct 路径的输出分块长度；必须 >= K-1，否则首块的零前缀逻辑不成立
+    // direct 路径的输出分块长度
     uint32_t tileLen = (L < FFT_CONV1D_DIRECT_TILE) ? L : FFT_CONV1D_DIRECT_TILE;
     if (tileLen < K)
     {
-        tileLen = K; // K <= L，所以这一步不会超过 L
+        tileLen = K; // K <= L，不会超过 L
     }
 
-    // ---------------- 6. Matmul tiling（单核视角，每个核算自己的 GEMM）----------------
+    // 重写后 FFT 路径是纯 Vector 实现，不再需要 Cube，因此没有 Matmul tiling。
+    // （此前 GetTiling 返回 -1 的问题也随之消失。）
     FftConv1dTilingData tilingData;
-    MatmulApiTiling mmTiling(ascendcPlatform);
-    mmTiling.SetAType(TPosition::GM, CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    mmTiling.SetBType(TPosition::GM, CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    mmTiling.SetCType(TPosition::GM, CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    mmTiling.SetShape(static_cast<int32_t>(nRadix), static_cast<int32_t>(nRadix),
-                      static_cast<int32_t>(nRadix));
-    mmTiling.SetOrgShape(static_cast<int32_t>(nRadix), static_cast<int32_t>(nRadix),
-                         static_cast<int32_t>(nRadix));
-    mmTiling.SetBias(false);
-    mmTiling.SetBufferSpace(-1, -1, -1);
-    if (mmTiling.GetTiling(tilingData.cubeTiling) == -1)
-    {
-        return ge::GRAPH_FAILED;
-    }
+
+    printf("[fft_conv1d tiling] B=%u H=%u L=%u K=%u | algo=%s N=%u N1=%u cores=%u tileLen=%u\n",
+           B, H, L, K, (algo == FFT_CONV1D_ALGO_FFT) ? "FFT" : "DIRECT",
+           nFft, nRadix, usedCoreNum, tileLen);
 
     // ---------------- 7. 填 TilingData ----------------
     tilingData.set_batch(B);
@@ -181,29 +154,16 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     context->GetRawTilingData()->SetDataSize(tilingData.GetDataSize());
 
     // ---------------- 8. workspace ----------------
-    // FFT 路径布局（单位：float）：
-    //   [0]        Dr   : N            (N1*N1 == N)
-    //   [N]        Di   : N
-    //   [2N]       Tr   : N
-    //   [3N]       Ti   : N
-    //   [4N]       Kfr  : H*N
-    //   [4N+HN]    Kfi  : H*N
-    //   [4N+2HN]   每核 scratch : usedCoreNum * SCRATCH_BUFS * N
-    // direct 路径布局：每核一份零前缀输入行 (K-1+L)，按 8 对齐
+    // FFT 路径：全部数据常驻 UB，不需要用户 workspace
+    // DIRECT 路径：每核一份零前缀输入行 (K-1+L)，按 8 对齐
     size_t userWorkspace = 0;
     if (algo == FFT_CONV1D_ALGO_FFT)
     {
-        const size_t n = static_cast<size_t>(nFft);
-        userWorkspace = (4 * n + 2 * static_cast<size_t>(H) * n +
-                         static_cast<size_t>(usedCoreNum) * FFT_CONV1D_SCRATCH_BUFS * n) *
-                        sizeof(float);
+        userWorkspace = 0; // 全部数据常驻 UB
     }
     else
     {
-        // DIRECT 是纯 Vector 路径，kernel 里按 GetBlockIdx() 分片，
-        // 而 MIX 模式下 AIV 的 GetBlockIdx() 范围是 [0, blockDim*2)，
-        // 所以必须按 blockDim*2 份分配，否则最后一半 AIV 会越界写。
-        // （当前之所以没暴露，是越界部分正好落进了系统 workspace 区。）
+        // 每核一份，2 倍余量（AIV_ONLY 下 blockDim 即核数，2x 纯属保险）
         const size_t rowLen = ((static_cast<size_t>(K) - 1 + L + 7) / 8) * 8;
         userWorkspace = 2 * static_cast<size_t>(usedCoreNum) * rowLen * sizeof(float);
     }
