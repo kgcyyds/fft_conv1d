@@ -2,7 +2,7 @@
  * fft_conv1d 单算子调用示例（aclnn 接口）
  *
  * 用法：
- *   ./fft_conv1d_test <data_dir> <B> <H> <L> <K> <flip_kernel>
+ *   ./fft_conv1d_test <data_dir> <B> <H> <L> <K>
  * 读取 <data_dir>/x.bin、<data_dir>/kernel.bin，输出写 <data_dir>/npu_out.bin
  *
  * aclnn 接口名由算子定义自动生成：算子 FftConv1d -> aclnnFftConv1d
@@ -73,9 +73,9 @@ static aclTensor *MakeTensor(const std::vector<int64_t> &shape, void *devPtr)
 
 int main(int argc, char **argv)
 {
-    if (argc < 7)
+    if (argc < 6)
     {
-        std::printf("用法: %s <data_dir> <B> <H> <L> <K> <flip_kernel>\n", argv[0]);
+        std::printf("用法: %s <data_dir> <B> <H> <L> <K>\n", argv[0]);
         return -1;
     }
     const std::string dir = argv[1];
@@ -83,7 +83,6 @@ int main(int argc, char **argv)
     const int64_t H = std::atoll(argv[3]);
     const int64_t L = std::atoll(argv[4]);
     const int64_t K = std::atoll(argv[5]);
-    const int64_t flipKernel = std::atoll(argv[6]);
 
     const size_t xCount = static_cast<size_t>(B * H * L);
     const size_t kCount = static_cast<size_t>(H * K);
@@ -117,17 +116,16 @@ int main(int argc, char **argv)
 
     uint64_t workspaceSize = 0;
     aclOpExecutor *executor = nullptr;
-    CHECK(aclnnFftConv1dGetWorkspaceSize(xT, kT, flipKernel, yT, &workspaceSize, &executor));
+    CHECK(aclnnFftConv1dGetWorkspaceSize(xT, kT, yT, &workspaceSize, &executor));
 
     void *workspace = nullptr;
     if (workspaceSize > 0)
     {
         CHECK(aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST));
     }
-    std::printf("[run] B=%lld H=%lld L=%lld K=%lld flip=%lld workspace=%llu bytes\n",
+    std::printf("[run] B=%lld H=%lld L=%lld K=%lld workspace=%llu bytes\n",
                 static_cast<long long>(B), static_cast<long long>(H), static_cast<long long>(L),
-                static_cast<long long>(K), static_cast<long long>(flipKernel),
-                static_cast<unsigned long long>(workspaceSize));
+                static_cast<long long>(K), static_cast<unsigned long long>(workspaceSize));
 
     CHECK(aclnnFftConv1d(workspace, workspaceSize, executor, stream));
     CHECK(aclrtSynchronizeStream(stream));

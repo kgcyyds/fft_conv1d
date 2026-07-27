@@ -47,7 +47,7 @@ def main():
     scale = max(1.0, golden.abs().max().item())
     rel = max_abs / scale
 
-    print(f"[compare] shape={shape} K={meta['K']} mode={meta.get('mode')}")
+    print(f"[compare] shape={shape} K={meta['K']}")
     print(f"[compare] golden 幅值范围 [{golden.min().item():.4f}, {golden.max().item():.4f}]")
     print(f"[compare] 最大绝对误差 = {max_abs:.3e}")
     print(f"[compare] 最大相对误差 = {rel:.3e}   (目标 < 1e-4)")

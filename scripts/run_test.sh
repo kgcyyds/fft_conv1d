@@ -8,7 +8,9 @@
 #
 # 用法：
 #   bash scripts/run_test.sh              # 跑全部用例
-#   bash scripts/run_test.sh 2 16 257 17 0  # 跑单个用例 B H L K flip
+#   bash scripts/run_test.sh direct       # 只跑 DIRECT 路径（K<64）
+#   bash scripts/run_test.sh fft          # 只跑 FFT 路径（K>=64）
+#   bash scripts/run_test.sh 2 16 257 17  # 跑单个用例 B H L K
 set -e
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -21,50 +23,68 @@ if [ ! -x "${BIN}" ]; then
     exit 1
 fi
 
+FAILED=0
+
 run_case() {
-    local B=$1 H=$2 L=$3 K=$4 FLIP=$5
+    local B=$1 H=$2 L=$3 K=$4
     echo "=================================================================="
-    echo "用例: B=${B} H=${H} L=${L} K=${K} flip_kernel=${FLIP}"
+    echo "用例: B=${B} H=${H} L=${L} K=${K}"
     echo "=================================================================="
     rm -rf "${DATA}"
-    python3 "${ROOT}/scripts/gen_data.py" --b "${B}" --h "${H}" --l "${L}" --k "${K}" \
-        --flip "${FLIP}" --out "${DATA}"
-    "${BIN}" "${DATA}" "${B}" "${H}" "${L}" "${K}" "${FLIP}"
-    python3 "${ROOT}/scripts/compare_data.py" --dir "${DATA}"
+    python3 "${ROOT}/scripts/gen_data.py" --b "${B}" --h "${H}" --l "${L}" --k "${K}" --out "${DATA}"
+    "${BIN}" "${DATA}" "${B}" "${H}" "${L}" "${K}"
+    if python3 "${ROOT}/scripts/compare_data.py" --dir "${DATA}"; then :; else FAILED=1; fi
     echo ""
 }
 
-if [ $# -eq 5 ]; then
-    run_case "$1" "$2" "$3" "$4" "$5"
-    exit 0
-fi
+# K < 64 -> DIRECT 路径（含题目要求覆盖的全部 shape）
+run_direct() {
+    echo "###### DIRECT 路径（K<64）######"
+    run_case 1 1 16 3
+    run_case 2 3 31 7
+    run_case 4 8 64 1
+    run_case 1 5 100 32
+    run_case 2 16 257 17
+    # 移位副本方案的重点用例：K 跨越 8 的边界、K 接近上限、L 跨多个 tile
+    run_case 1 1 8 8
+    run_case 2 2 100 63
+    run_case 1 1 2000 40
+    run_case 3 2 30 3
+    run_case 1 3 513 5
+    run_case 1 1 1 1
+    run_case 2 2 1024 63
+}
 
-FAILED=0
+# K >= 64 -> FFT 路径
+run_fft() {
+    echo "###### FFT 路径（K>=64）######"
+    run_case 1 1 64 64
+    run_case 2 4 128 64
+    run_case 2 2 256 128
+    run_case 1 8 512 256
+    run_case 2 2 1024 1024
+    run_case 1 1 100 100
+    run_case 3 2 300 200
+    run_case 1 5 255 255
+    # R = B*H 小于核数，检验空闲核不参与时的行为
+    run_case 1 1 512 512
+    # R 不能被核数整除
+    run_case 3 7 256 100
+}
 
-echo "###### 第一组：题目要求覆盖的 shape（K<64，全部走 DIRECT 路径）######"
-run_case 1 1 16 3 0   || FAILED=1
-run_case 2 3 31 7 0   || FAILED=1
-run_case 4 8 64 1 0   || FAILED=1
-run_case 1 5 100 32 0 || FAILED=1
-run_case 2 16 257 17 0 || FAILED=1
-
-echo "###### 第二组：K>=64，走 FFT 路径（本算子的目标区间）######"
-run_case 1 1 64 64 0   || FAILED=1
-run_case 2 4 128 64 0  || FAILED=1
-run_case 2 2 256 128 0 || FAILED=1
-run_case 1 8 512 256 0 || FAILED=1
-run_case 2 2 1024 1024 0 || FAILED=1
-
-echo "###### 第三组：corr 语义（复现题目原始 PyTorch 片段）######"
-run_case 2 3 31 7 1    || FAILED=1
-run_case 2 2 256 128 1 || FAILED=1
-
-echo "###### 第四组：边界 ######"
-run_case 1 1 1 1 0     || FAILED=1
-run_case 1 1 8 8 0     || FAILED=1
-run_case 3 2 30 3 0    || FAILED=1
-run_case 1 3 513 5 0   || FAILED=1
-run_case 5 3 100 20 0  || FAILED=1
+case "$1" in
+    direct) run_direct ;;
+    fft)    run_fft ;;
+    "")     run_direct; run_fft ;;
+    *)
+        if [ $# -eq 4 ]; then
+            run_case "$1" "$2" "$3" "$4"
+        else
+            echo "用法: bash scripts/run_test.sh [direct|fft| B H L K]"
+            exit 1
+        fi
+        ;;
+esac
 
 if [ ${FAILED} -eq 0 ]; then
     echo "全部用例 PASS"
