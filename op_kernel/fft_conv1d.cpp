@@ -26,7 +26,7 @@
 // FFT-GM 尚未验证通过。置 0 时整段不参与编译，确保它不会影响
 // 已验证正确的 DIRECT / FFT-UB 两条路径。需与 host 的
 // FFT_CONV1D_ENABLE_GM 保持一致。
-#define FFT_CONV1D_ENABLE_GM_KERNEL 0
+#define FFT_CONV1D_ENABLE_GM_KERNEL 1
 
 #include "kernel_operator.h"
 
@@ -351,6 +351,11 @@ class FftConv1dFft
     // ------------------------------------------------------------------
     __aicore__ inline void BuildTables()
     {
+        // 纯 Vector 工作：只在 AIV 上做，AIC 跳过（否则会重复写 GM）
+        if ASCEND_IS_AIC
+        {
+            return;
+        }
         LocalTensor<float> dr = bDr_.Get<float>();
         LocalTensor<float> di = bDi_.Get<float>();
         LocalTensor<float> tr = bTr_.Get<float>();
@@ -706,6 +711,11 @@ class FftConv1dFftGm
 
     __aicore__ inline void CopyG(uint64_t dst, uint64_t src)
     {
+        // 纯 Vector 工作：只在 AIV 上做，AIC 跳过（否则会重复写 GM）
+        if ASCEND_IS_AIC
+        {
+            return;
+        }
         LocalTensor<float> t = b0_.Get<float>();
         LoadG(t, src);
         StoreG(dst, t);
@@ -716,6 +726,11 @@ class FftConv1dFftGm
     // 保证 D[k][n] == D[n][k] 精确成立（“D 对称所以不用转置”是本方案的前提）。
     __aicore__ inline void BuildTables()
     {
+        // 纯 Vector 工作：只在 AIV 上做，AIC 跳过（否则会重复写 GM）
+        if ASCEND_IS_AIC
+        {
+            return;
+        }
         LocalTensor<float> idx = bIdx_.Get<float>();
         LocalTensor<float> ang = bAng_.Get<float>();
         LocalTensor<uint8_t> tmp = bTmp_.Get<uint8_t>();
@@ -765,24 +780,36 @@ class FftConv1dFftGm
     // 因此循环次数可以按通道自然切分，不需要 active 补齐。
     __aicore__ inline void MatMulG(uint64_t c, uint64_t a, uint64_t b)
     {
-        // Vector 侧 SetFlag（MTE3 流水，即写 GM 那条），Cube 侧 WaitFlag
-        CrossCoreSetFlag<2, PIPE_MTE3>(FLAG_V2C);
-        CrossCoreWaitFlag(FLAG_V2C);
-
-        mm_.SetTensorA(wsGm_[a]);
-        mm_.SetTensorB(wsGm_[b]);
-        mm_.IterateAll(wsGm_[c]);
-        mm_.End();
-
-        // Cube 侧 SetFlag（FIX 流水，即写回 GM 那条），Vector 侧 WaitFlag
-        CrossCoreSetFlag<2, PIPE_FIX>(FLAG_C2V);
-        CrossCoreWaitFlag(FLAG_C2V);
+        // 模式 2 的语义是**有方向的**：每个 flag 只能由一方 Set、另一方 Wait。
+        // 两边都执行 Set+Wait 会互相等待而死锁（上一版就是这么挂的）。
+        if ASCEND_IS_AIV
+        {
+            CrossCoreSetFlag<2, PIPE_MTE3>(FLAG_V2C); // Vector 写完 GM
+        }
+        if ASCEND_IS_AIC
+        {
+            CrossCoreWaitFlag(FLAG_V2C);              // 等两个 AIV
+            mm_.SetTensorA(wsGm_[a]);
+            mm_.SetTensorB(wsGm_[b]);
+            mm_.IterateAll(wsGm_[c]);
+            mm_.End();
+            CrossCoreSetFlag<2, PIPE_FIX>(FLAG_C2V);  // Cube 写完 GM
+        }
+        if ASCEND_IS_AIV
+        {
+            CrossCoreWaitFlag(FLAG_C2V);              // 等 AIC
+        }
     }
 
     // ---------------- 逐点运算：整块进出 ----------------
     // kind: 0 = a+b, 1 = a-b, 2 = (a+b)*s
     __aicore__ inline void BinG(uint64_t dst, uint64_t oa, uint64_t ob, int32_t kind, float s)
     {
+        // 纯 Vector 工作：只在 AIV 上做，AIC 跳过（否则会重复写 GM）
+        if ASCEND_IS_AIC
+        {
+            return;
+        }
         LocalTensor<float> a = b0_.Get<float>();
         LocalTensor<float> b = b1_.Get<float>();
         LocalTensor<float> c = b2_.Get<float>();
@@ -809,6 +836,11 @@ class FftConv1dFftGm
     __aicore__ inline void CMulG(uint64_t oar, uint64_t oai, uint64_t obr, uint64_t obi,
                                  bool conjB)
     {
+        // 纯 Vector 工作：只在 AIV 上做，AIC 跳过（否则会重复写 GM）
+        if ASCEND_IS_AIC
+        {
+            return;
+        }
         LocalTensor<float> ar = b0_.Get<float>();
         LocalTensor<float> ai = b1_.Get<float>();
         LocalTensor<float> br = b2_.Get<float>();
@@ -881,6 +913,11 @@ class FftConv1dFftGm
     __aicore__ inline void LoadRowG(uint64_t dst, const GlobalTensor<float> &src, uint64_t off,
                                     int32_t count)
     {
+        // 纯 Vector 工作：只在 AIV 上做，AIC 跳过（否则会重复写 GM）
+        if ASCEND_IS_AIC
+        {
+            return;
+        }
         LocalTensor<float> a = b0_.Get<float>();
         Duplicate(a, 0.0f, N_);
         PipeBarrier<PIPE_V>();
@@ -897,6 +934,11 @@ class FftConv1dFftGm
     // 因果卷积取线性卷积前 L 点，偏移为 0
     __aicore__ inline void StoreOutG(uint64_t yOff)
     {
+        // 纯 Vector 工作：只在 AIV 上做，AIC 跳过（否则会重复写 GM）
+        if ASCEND_IS_AIC
+        {
+            return;
+        }
         LocalTensor<float> a = b0_.Get<float>();
         LoadG(a, Buf(XR));
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);

@@ -37,7 +37,7 @@ constexpr uint32_t FFT_CONV1D_MAX_NFFT_UB = 1024;  // UB 常驻上限 => N1 = 32
 //              1 = 启用
 // 当前置 0：FFT-GM 尚未验证通过，关闭后算子对所有 shape 都是正确的。
 // 代码保留在 op_kernel 里，拿到观测手段后再打开排查。
-constexpr uint32_t FFT_CONV1D_ENABLE_GM = 0;
+constexpr uint32_t FFT_CONV1D_ENABLE_GM = 1;
 
 constexpr uint32_t FFT_CONV1D_MAX_NFFT =
     FFT_CONV1D_ENABLE_GM ? 4096u : FFT_CONV1D_MAX_NFFT_UB; // GM 版上限 => N1 = 64
