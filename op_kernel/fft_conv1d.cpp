@@ -711,7 +711,13 @@ class FftConv1dFftGm
     {
         mm_.SetTensorA(wsGm_[a]);
         mm_.SetTensorB(wsGm_[b]);
-        mm_.IterateAll(wsGm_[c]);
+        // 关键：输出到 GM 的 IterateAll 重载默认 waitIterateAll=false，是**异步**的
+        //   IterateAll(gm, enAtomic=0, enSequentialWrite=false, waitIterateAll=false, ...)
+        // 必须显式置 true 等待 Cube 写回完成，否则紧接着的 Vector 读到的是旧数据。
+        // 注意 PipeBarrier 在这里不管用：它只约束同一个核内的流水，而 MIX 下
+        // Cube 在 AIC、Vector 在 AIV，是两个核。
+        // （UB 版走的是 IterateAll(LocalTensor) 同步重载，所以没有这个问题。）
+        mm_.IterateAll(wsGm_[c], 0, false, true);
         mm_.End();
         PipeBarrier<PIPE_ALL>();
     }

@@ -18,12 +18,12 @@ constexpr uint32_t FFT_CONV1D_ALGO_FFT = 1;     // UB 常驻（N <= FFT_CONV1D_M
 constexpr uint32_t FFT_CONV1D_ALGO_FFT_GM = 2;  // GM 版（更大的 N）
 
 // 调试开关：强制单核（blockDim = 1）。
-// 单核可一次性排除多核相关的全部复杂度：scratch 分片、跨核共享、栅栏计数匹配。
-// 若单核仍然出错，问题必定在单核内部逻辑（常量表 / GEMM / 数据流），排查范围大幅缩小。
-// 注意：单核 ≠ 单执行单元。MIX 模式下 blockDim=1 仍有 1 个 AIC + 2 个 AIV，
-//       AIV 的 GetBlockIdx() 仍会取到 0 和 1，所以 CoreIdx() 的除法依然必要。
-// 定位完成后改回 0 恢复多核。
-constexpr uint32_t FFT_CONV1D_FORCE_SINGLE_CORE = 1;
+// 多核路径（UB 版 + Cube）已实测验证通过，因此默认关闭。
+// 保留这个开关是因为它在定位问题时价值很高：一旦怀疑某个 bug 与多核分片有关，
+// 打开它就能一次性排除 scratch 分片、跨核共享、栅栏计数三类因素。
+// 注意：单核 != 单执行单元。MIX 模式下 blockDim=1 仍有 1 个 AIC + 2 个 AIV，
+//       AIV 的 GetBlockIdx() 仍会取到 0 和 1，所以 CoreIdx() 的除法始终必要。
+constexpr uint32_t FFT_CONV1D_FORCE_SINGLE_CORE = 0;
 
 // v1 约束（同时写入 host 校验与文档，不做隐式假设）
 // FFT 路径 N_fft 上限。重写版把中间结果全部放 UB：12 个长度 N 的缓冲，
