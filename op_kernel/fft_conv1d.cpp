@@ -64,6 +64,11 @@ constexpr bool CONSERVATIVE_SYNC = false;
 // 两者必有一个对。改这一行重编即可 A/B。
 constexpr int32_t GM_USE_USER_WS = 1;
 
+// FFT-GM 的 AIC<->AIV 同步标记（模式 2 = AI Core 内部，Cube 与 Vector 之间）。
+// flagId 取值范围 0-10。两个方向各用一个，避免计数器互相干扰。
+constexpr uint16_t FLAG_V2C = 0; // Vector 写完 GM -> Cube 可读
+constexpr uint16_t FLAG_C2V = 1; // Cube 写完 GM -> Vector 可读
+
 __aicore__ inline void CubeVecSync()
 {
     if (CONSERVATIVE_SYNC)
@@ -644,32 +649,23 @@ class FftConv1dFftGm
     __aicore__ inline void Process()
     {
         BuildTables();
-        SyncAll(); // 常量表就绪
-
-        // 两层循环的次数对所有核都相同 —— 这是能用 SyncAll 的前提。
-        // 分不到通道的核仍然走完全部流程（在自己的 scratch 上算废数据），
-        // 只是不写回输出，从而保证 SyncAll 调用次数处处一致。
-        const int32_t chPerCore = (H_ + cores_ - 1) / cores_;
-        for (int32_t i = 0; i < chPerCore; ++i)
+        // 按通道自然切分：每核独占若干通道，GM 缓冲按 CoreIdx 分片 => 零跨核共享。
+        // AIC/AIV 的汇合由 MatMulG 里的模式 2 标记完成，与其他核无关，
+        // 所以各核迭代次数不同也没关系。
+        for (int32_t h = CoreIdx(); h < H_; h += cores_)
         {
-            const int32_t h = CoreIdx() + i * cores_;
-            const bool active = (h < H_);
-            LoadRowG(Buf(XR), wGm_, static_cast<uint64_t>(active ? h : 0) * K_, K_);
+            LoadRowG(Buf(XR), wGm_, static_cast<uint64_t>(h) * K_, K_);
             Forward();
             CopyG(Buf(KR), Buf(XR));
             CopyG(Buf(KI), Buf(XI));
-
             for (int32_t b = 0; b < B_; ++b)
             {
-                const int32_t row = active ? (b * H_ + h) : 0;
+                const int32_t row = b * H_ + h;
                 LoadRowG(Buf(XR), xGm_, static_cast<uint64_t>(row) * L_, L_);
                 Forward();
                 CMulG(Buf(XR), Buf(XI), Buf(KR), Buf(KI), false);
                 Inverse();
-                if (active)
-                {
-                    StoreOutG(static_cast<uint64_t>(row) * L_);
-                }
+                StoreOutG(static_cast<uint64_t>(row) * L_);
             }
         }
     }
@@ -753,22 +749,28 @@ class FftConv1dFftGm
     // 与已验证的 UB 路径完全一致，因此不存在跨核可见性问题。
     // 矩阵乘：A/B/C 全在 GM，Cube 直接读写。
     //
-    // 同步方式照搬 AscendC-S4 模板中已验证可用的写法：**SyncAll 夹逼**。
-    //   Vector 写 GM -> SyncAll -> Cube 读写 GM -> SyncAll -> Vector 读 GM
-    // 这里 SyncAll 的作用不是跨核数据同步（本设计每核零共享），
-    // 而是 **AIC 与 AIV 之间的汇合点**。PipeBarrier 做不到这一点：
-    // 它只约束同一个核内部的流水，而 MIX 下 Cube 在 AIC、Vector 在 AIV。
-    //
-    // 前提：调用点必须位于**各核迭代次数相同**的循环内，否则 SyncAll 次数
-    // 不匹配会死锁。Process() 的两层循环为此都改成了固定次数 + active 标志。
+    // 同步用 **CrossCoreSetFlag/WaitFlag 模式 2**（AI Core 内部 AIC<->AIV）。
+    // 这里要解决的是 “Vector 写 GM -> Cube 读 GM -> Vector 读 GM” 的可见性，
+    // 属于**块内**两个执行单元之间的问题：
+    //   - PipeBarrier 不行：只约束单核内部流水，跨不到另一个执行单元；
+    //   - SyncAll 也不合适：它是**全核**栅栏，而本设计每核独立处理不同通道、
+    //     彼此零共享，用全核栅栏既语义错位，又强迫所有核的循环次数一致。
+    // 模式 2 只在本 AI Core 的 AIC 与 AIV 之间汇合，各核互不影响，
+    // 因此循环次数可以按通道自然切分，不需要 active 补齐。
     __aicore__ inline void MatMulG(uint64_t c, uint64_t a, uint64_t b)
     {
-        SyncAll();
+        // Vector 侧 SetFlag（MTE3 流水，即写 GM 那条），Cube 侧 WaitFlag
+        CrossCoreSetFlag<2, PIPE_MTE3>(FLAG_V2C);
+        CrossCoreWaitFlag(FLAG_V2C);
+
         mm_.SetTensorA(wsGm_[a]);
         mm_.SetTensorB(wsGm_[b]);
         mm_.IterateAll(wsGm_[c]);
         mm_.End();
-        SyncAll();
+
+        // Cube 侧 SetFlag（FIX 流水，即写回 GM 那条），Vector 侧 WaitFlag
+        CrossCoreSetFlag<2, PIPE_FIX>(FLAG_C2V);
+        CrossCoreWaitFlag(FLAG_C2V);
     }
 
     // ---------------- 逐点运算：整块进出 ----------------

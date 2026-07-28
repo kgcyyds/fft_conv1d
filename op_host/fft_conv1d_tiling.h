@@ -33,7 +33,14 @@ constexpr uint32_t FFT_CONV1D_MAX_NFFT_UB = 1024;  // UB 常驻上限 => N1 = 32
 // GM 版上限：重设计后 Cube 永不碰 GM，运算整块经 UB 中转，
 // 复数逐点乘需同时驻留 6 个长度 N 的 UB 缓冲 => N=4096 时 6*16KB=96KB 为上限。
 // 超出由 host 回退 DIRECT（数值仍正确）。
-constexpr uint32_t FFT_CONV1D_MAX_NFFT = 4096;     // GM 版上限 => N1 = 64
+// FFT-GM 开关。0 = 关闭（N>1024 的 shape 回退 DIRECT，数值正确但较慢）
+//              1 = 启用
+// 当前置 0：FFT-GM 尚未验证通过，关闭后算子对所有 shape 都是正确的。
+// 代码保留在 op_kernel 里，拿到观测手段后再打开排查。
+constexpr uint32_t FFT_CONV1D_ENABLE_GM = 1;
+
+constexpr uint32_t FFT_CONV1D_MAX_NFFT =
+    FFT_CONV1D_ENABLE_GM ? 4096u : FFT_CONV1D_MAX_NFFT_UB; // GM 版上限 => N1 = 64
 constexpr uint32_t FFT_CONV1D_GM_BUFS = 12;        // GM 版每核缓冲个数，与 kernel 一致
 constexpr uint32_t FFT_CONV1D_FFT_MIN_K = 64;    // K 小于该值走 direct（见设计文档 §9）
 constexpr uint32_t FFT_CONV1D_DIRECT_TILE = 4096; // direct 路径的输出分块长度
