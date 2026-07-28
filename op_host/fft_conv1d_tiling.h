@@ -47,6 +47,7 @@ TILING_DATA_FIELD_DEF(uint32_t, nRadix);     // N1 = N2 = sqrt(N)
 TILING_DATA_FIELD_DEF(uint32_t, usedCoreNum);
 TILING_DATA_FIELD_DEF(uint32_t, tileLen);    // direct 路径输出分块长度
 TILING_DATA_FIELD_DEF(uint32_t, rowsPerCore);
+TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, cubeTiling); // 供 kernel 的 Cube 开关使用
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(FftConv1d, FftConv1dTilingData)

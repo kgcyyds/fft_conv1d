@@ -14,7 +14,20 @@
  *   - 12 次 GEMM 形状统一为 (M=N1, K=N1, N=N1)，共用一个 Matmul 对象与一套 TCubeTiling
  * 数值路径已在 python/fft_conv1d_four_step.py 的 plan_v1 中逐步验证。
  */
+// ---------------------------------------------------------------------------
+// Cube 开关：0 = Vector 版矩阵乘（Axpy 循环，当前已验证数值正确）
+//            1 = Cube 版矩阵乘（Matmul 高阶 API，UB 进 / UB 出）
+// 只影响 MatMulUB 一个函数，其余结构完全相同，因此可以一键 A/B 对照。
+// 注意：Matmul 的 A/B 支持 TPosition::VECOUT、C 支持 TPosition::VECIN，
+//       操作数直接用 UB 上的 LocalTensor，不需要经过 GM。
+// ---------------------------------------------------------------------------
+#define FFT_CONV1D_USE_CUBE 0
+
 #include "kernel_operator.h"
+
+// 必须无条件包含：自动生成的 TilingData 里含 TCubeTiling 字段，
+// 即使 USE_CUBE=0 也需要这个类型可见。
+#include "lib/matmul_intf.h"
 
 using namespace AscendC;
 
@@ -252,6 +265,16 @@ class FftConv1dDirect
 class FftConv1dFft
 {
   public:
+#if FFT_CONV1D_USE_CUBE
+    // 12 次矩阵乘形状统一为 (N1, N1, N1)，共用一个对象。
+    // A/B 放 VECOUT、C 放 VECIN => 全程 UB，不落 GM。
+    Matmul<MatmulType<TPosition::VECOUT, CubeFormat::ND, float>,
+           MatmulType<TPosition::VECOUT, CubeFormat::ND, float>,
+           MatmulType<TPosition::VECIN, CubeFormat::ND, float>,
+           MatmulType<TPosition::GM, CubeFormat::ND, float>>
+        mm_;
+#endif
+
     __aicore__ inline FftConv1dFft()
     {
     }
@@ -383,7 +406,18 @@ class FftConv1dFft
     __aicore__ inline void MatMulUB(const LocalTensor<float> &c, const LocalTensor<float> &a,
                                     const LocalTensor<float> &b)
     {
-        // a 由上一步的 Vector 运算写出，标量单元读它之前必须同步
+#if FFT_CONV1D_USE_CUBE
+        // Cube 版：A/B 从 UB(VECOUT) 送入，C 直接写回 UB(VECIN)
+        mm_.SetTensorA(a);
+        mm_.SetTensorB(b);
+        mm_.IterateAll(c);
+        mm_.End();
+        PipeBarrier<PIPE_ALL>();
+#else
+        // Vector 版：C[i][:] = sum_k A[i][k] * B[k][:]
+        // 每次 Axpy 处理一整行（N1 个 float），偏移 i*N1 / k*N1 都是 N1 的倍数，
+        // N1 ∈ {16,32} 均为 8 的倍数 => 首地址天然 32B 对齐。
+        // a 由上一步 Vector 运算写出，标量单元读它之前必须同步。
         SetFlag<HardEvent::V_S>(EVENT_ID0);
         WaitFlag<HardEvent::V_S>(EVENT_ID0);
         for (int32_t i = 0; i < N1_; ++i)
@@ -396,6 +430,7 @@ class FftConv1dFft
             }
             PipeBarrier<PIPE_V>();
         }
+#endif
     }
 
     // (ar,ai) *= (br,bi)，conjB 时用 (br,-bi)。4 次实乘，数值最稳。
@@ -548,8 +583,11 @@ extern "C" __global__ __aicore__ void fft_conv1d(GM_ADDR x, GM_ADDR kernel, GM_A
                                                  GM_ADDR workspace, GM_ADDR tiling)
 {
     GET_TILING_DATA(tilingData, tiling);
-    // 重写后两条路径都是纯 Vector 实现，不再需要 MIX（Cube）模式
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+#if FFT_CONV1D_USE_CUBE
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2); // FFT 路径要用 Cube
+#else
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);    // 两条路径都是纯 Vector
+#endif
 
     TPipe pipe;
     if (tilingData.algo == ALGO_DIRECT)
@@ -561,6 +599,9 @@ extern "C" __global__ __aicore__ void fft_conv1d(GM_ADDR x, GM_ADDR kernel, GM_A
     else
     {
         FftConv1dFft op;
+#if FFT_CONV1D_USE_CUBE
+        REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), op.mm_, &tilingData.cubeTiling);
+#endif
         op.Init(&pipe, x, kernel, y, workspace, tilingData);
         op.Process();
     }

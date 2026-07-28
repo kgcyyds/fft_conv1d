@@ -8,10 +8,12 @@
  * 注意：这是数学意义的卷积，不是 cross-correlation。
  */
 #include <cstdio>
+#include <cstring>
 
 #include "fft_conv1d_tiling.h"
 #include "register/op_def_registry.h"
 #include "tiling/platform/platform_ascendc.h"
+#include "tiling/tiling_api.h"
 
 
 namespace
@@ -126,9 +128,34 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         tileLen = K; // K <= L，不会超过 L
     }
 
-    // 重写后 FFT 路径是纯 Vector 实现，不再需要 Cube，因此没有 Matmul tiling。
-    // （此前 GetTiling 返回 -1 的问题也随之消失。）
     FftConv1dTilingData tilingData;
+    memset(&tilingData.cubeTiling, 0, sizeof(TCubeTiling));
+    // Cube 版矩阵乘需要 TCubeTiling。只在 FFT 路径求解：此时 N1 ∈ {16,32}，
+    // 不会再出现当初 DIRECT 路径下 N1=8 小于 fp32 分形导致 GetTiling 返回 -1 的情况。
+    // kernel 侧 FFT_CONV1D_USE_CUBE=0 时这份 tiling 不被使用，求解失败也只是回退，
+    // 不让整个算子失败。
+    if (algo == FFT_CONV1D_ALGO_FFT)
+    {
+        matmul_tiling::MatmulApiTiling mmT(ascendcPlatform);
+        mmT.SetAType(matmul_tiling::TPosition::VECOUT, matmul_tiling::CubeFormat::ND,
+                     matmul_tiling::DataType::DT_FLOAT);
+        mmT.SetBType(matmul_tiling::TPosition::VECOUT, matmul_tiling::CubeFormat::ND,
+                     matmul_tiling::DataType::DT_FLOAT);
+        mmT.SetCType(matmul_tiling::TPosition::VECIN, matmul_tiling::CubeFormat::ND,
+                     matmul_tiling::DataType::DT_FLOAT);
+        mmT.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                        matmul_tiling::DataType::DT_FLOAT);
+        const int32_t s1 = static_cast<int32_t>(nRadix);
+        mmT.SetShape(s1, s1, s1);
+        mmT.SetOrgShape(s1, s1, s1);
+        mmT.SetBias(false);
+        mmT.SetBufferSpace(-1, -1, -1);
+        if (mmT.GetTiling(tilingData.cubeTiling) == -1)
+        {
+            printf("[fft_conv1d tiling] 警告: N1=%u 的 Cube tiling 求解失败"
+                   "（USE_CUBE=0 时无影响）\n", nRadix);
+        }
+    }
 
     printf("[fft_conv1d tiling] B=%u H=%u L=%u K=%u | algo=%s N=%u N1=%u cores=%u tileLen=%u\n",
            B, H, L, K, (algo == FFT_CONV1D_ALGO_FFT) ? "FFT" : "DIRECT",
