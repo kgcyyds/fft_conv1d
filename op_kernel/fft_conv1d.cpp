@@ -62,17 +62,12 @@ constexpr float TWO_PI = 6.283185307179586f;
 // 从而确认问题是否出在 Cube 写 GM 对 Vector 的可见性上。
 constexpr bool CONSERVATIVE_SYNC = false;
 
-// FFT-GM 的用户 workspace 基址：这是目前唯一还没被单独验证过的假设。
-//   1 = GetUserWorkspace(workspace)  —— 文档说 workspace 前半段是系统区，
-//       Matmul 的内部 scratch 用它，用户数据应从这之后开始
-//   0 = workspace                    —— DIRECT 路径就是这么用的，且已验证可写
-// 两者必有一个对。改这一行重编即可 A/B。
-constexpr int32_t GM_USE_USER_WS = 1;
-
-// FFT-GM 的 AIC<->AIV 同步标记（模式 2 = AI Core 内部，Cube 与 Vector 之间）。
-// flagId 取值范围 0-10。两个方向各用一个，避免计数器互相干扰。
-constexpr uint16_t FLAG_V2C = 0; // Vector 写完 GM -> Cube 可读
-constexpr uint16_t FLAG_C2V = 1; // Cube 写完 GM -> Vector 可读
+// FFT-GM 的用户 workspace 基址。
+//   0 = workspace                   —— 与 DIRECT 路径一致，DIRECT 已验证可用
+//   1 = GetUserWorkspace(workspace) —— 文档说法，但从未单独验证过
+// 当前取 0：DIRECT 路径长期用裸 workspace 且结果正确，是更可靠的依据。
+// 若 GM 路径读回全 0，改成 1 再试一次即可 A/B。
+constexpr int32_t GM_USE_USER_WS = 0;
 
 __aicore__ inline void CubeVecSync()
 {
@@ -351,11 +346,6 @@ class FftConv1dFft
     // ------------------------------------------------------------------
     __aicore__ inline void BuildTables()
     {
-        // 纯 Vector 工作：只在 AIV 上做，AIC 跳过（否则会重复写 GM）
-        if ASCEND_IS_AIC
-        {
-            return;
-        }
         LocalTensor<float> dr = bDr_.Get<float>();
         LocalTensor<float> di = bDi_.Get<float>();
         LocalTensor<float> tr = bTr_.Get<float>();
@@ -660,23 +650,31 @@ class FftConv1dFftGm
     __aicore__ inline void Process()
     {
         BuildTables();
-        // 按通道自然切分：每核独占若干通道，GM 缓冲按 CoreIdx 分片 => 零跨核共享。
-        // AIC/AIV 的汇合由 MatMulG 里的模式 2 标记完成，与其他核无关，
-        // 所以各核迭代次数不同也没关系。
-        for (int32_t h = CoreIdx(); h < H_; h += cores_)
+        SyncAll();
+
+        // SyncAll 是全核栅栏，要求**所有核调用次数一致**，
+        // 所以两层循环都用固定次数 + active 标志（分不到通道的核照样走完流程，
+        // 只是不写回输出）。这也是 AscendC-S4 模板的做法。
+        const int32_t chPerCore = (H_ + cores_ - 1) / cores_;
+        for (int32_t i = 0; i < chPerCore; ++i)
         {
-            LoadRowG(Buf(XR), wGm_, static_cast<uint64_t>(h) * K_, K_);
+            const int32_t h = CoreIdx() + i * cores_;
+            const bool active = (h < H_);
+            LoadRowG(Buf(XR), wGm_, static_cast<uint64_t>(active ? h : 0) * K_, K_);
             Forward();
             CopyG(Buf(KR), Buf(XR));
             CopyG(Buf(KI), Buf(XI));
             for (int32_t b = 0; b < B_; ++b)
             {
-                const int32_t row = b * H_ + h;
+                const int32_t row = active ? (b * H_ + h) : 0;
                 LoadRowG(Buf(XR), xGm_, static_cast<uint64_t>(row) * L_, L_);
                 Forward();
                 CMulG(Buf(XR), Buf(XI), Buf(KR), Buf(KI), false);
                 Inverse();
-                StoreOutG(static_cast<uint64_t>(row) * L_);
+                if (active)
+                {
+                    StoreOutG(static_cast<uint64_t>(row) * L_);
+                }
             }
         }
     }
@@ -711,11 +709,6 @@ class FftConv1dFftGm
 
     __aicore__ inline void CopyG(uint64_t dst, uint64_t src)
     {
-        // 纯 Vector 工作：只在 AIV 上做，AIC 跳过（否则会重复写 GM）
-        if ASCEND_IS_AIC
-        {
-            return;
-        }
         LocalTensor<float> t = b0_.Get<float>();
         LoadG(t, src);
         StoreG(dst, t);
@@ -726,11 +719,6 @@ class FftConv1dFftGm
     // 保证 D[k][n] == D[n][k] 精确成立（“D 对称所以不用转置”是本方案的前提）。
     __aicore__ inline void BuildTables()
     {
-        // 纯 Vector 工作：只在 AIV 上做，AIC 跳过（否则会重复写 GM）
-        if ASCEND_IS_AIC
-        {
-            return;
-        }
         LocalTensor<float> idx = bIdx_.Get<float>();
         LocalTensor<float> ang = bAng_.Get<float>();
         LocalTensor<uint8_t> tmp = bTmp_.Get<uint8_t>();
@@ -770,46 +758,28 @@ class FftConv1dFftGm
     // 与已验证的 UB 路径完全一致，因此不存在跨核可见性问题。
     // 矩阵乘：A/B/C 全在 GM，Cube 直接读写。
     //
-    // 同步用 **CrossCoreSetFlag/WaitFlag 模式 2**（AI Core 内部 AIC<->AIV）。
-    // 这里要解决的是 “Vector 写 GM -> Cube 读 GM -> Vector 读 GM” 的可见性，
-    // 属于**块内**两个执行单元之间的问题：
-    //   - PipeBarrier 不行：只约束单核内部流水，跨不到另一个执行单元；
-    //   - SyncAll 也不合适：它是**全核**栅栏，而本设计每核独立处理不同通道、
-    //     彼此零共享，用全核栅栏既语义错位，又强迫所有核的循环次数一致。
-    // 模式 2 只在本 AI Core 的 AIC 与 AIV 之间汇合，各核互不影响，
-    // 因此循环次数可以按通道自然切分，不需要 active 补齐。
     __aicore__ inline void MatMulG(uint64_t c, uint64_t a, uint64_t b)
     {
-        // 模式 2 的语义是**有方向的**：每个 flag 只能由一方 Set、另一方 Wait。
-        // 两边都执行 Set+Wait 会互相等待而死锁（上一版就是这么挂的）。
-        if ASCEND_IS_AIV
-        {
-            CrossCoreSetFlag<2, PIPE_MTE3>(FLAG_V2C); // Vector 写完 GM
-        }
-        if ASCEND_IS_AIC
-        {
-            CrossCoreWaitFlag(FLAG_V2C);              // 等两个 AIV
-            mm_.SetTensorA(wsGm_[a]);
-            mm_.SetTensorB(wsGm_[b]);
-            mm_.IterateAll(wsGm_[c]);
-            mm_.End();
-            CrossCoreSetFlag<2, PIPE_FIX>(FLAG_C2V);  // Cube 写完 GM
-        }
-        if ASCEND_IS_AIV
-        {
-            CrossCoreWaitFlag(FLAG_C2V);              // 等 AIC
-        }
+        // 同步只能用 SyncAll()。
+        // 官方文档说明：Matmul 高阶 API **内部已经使用 CrossCoreSetFlag/WaitFlag**
+        // 做核间同步，不建议再手工调用该接口 —— 手工插入会与它的内部握手
+        // 争用同一组 flag 计数器，导致死锁（上一版正是这么挂的）。
+        // PipeBarrier 也不行：只约束单核内流水，跨不到 AIC/AIV。
+        //
+        // 代价：SyncAll 是全核栅栏，要求所有核调用次数一致，
+        // 因此 Process() 的循环必须是固定次数 + active 标志。
+        SyncAll();
+        mm_.SetTensorA(wsGm_[a]);
+        mm_.SetTensorB(wsGm_[b]);
+        mm_.IterateAll(wsGm_[c]);
+        mm_.End();
+        SyncAll();
     }
 
     // ---------------- 逐点运算：整块进出 ----------------
     // kind: 0 = a+b, 1 = a-b, 2 = (a+b)*s
     __aicore__ inline void BinG(uint64_t dst, uint64_t oa, uint64_t ob, int32_t kind, float s)
     {
-        // 纯 Vector 工作：只在 AIV 上做，AIC 跳过（否则会重复写 GM）
-        if ASCEND_IS_AIC
-        {
-            return;
-        }
         LocalTensor<float> a = b0_.Get<float>();
         LocalTensor<float> b = b1_.Get<float>();
         LocalTensor<float> c = b2_.Get<float>();
@@ -836,11 +806,6 @@ class FftConv1dFftGm
     __aicore__ inline void CMulG(uint64_t oar, uint64_t oai, uint64_t obr, uint64_t obi,
                                  bool conjB)
     {
-        // 纯 Vector 工作：只在 AIV 上做，AIC 跳过（否则会重复写 GM）
-        if ASCEND_IS_AIC
-        {
-            return;
-        }
         LocalTensor<float> ar = b0_.Get<float>();
         LocalTensor<float> ai = b1_.Get<float>();
         LocalTensor<float> br = b2_.Get<float>();
@@ -913,11 +878,6 @@ class FftConv1dFftGm
     __aicore__ inline void LoadRowG(uint64_t dst, const GlobalTensor<float> &src, uint64_t off,
                                     int32_t count)
     {
-        // 纯 Vector 工作：只在 AIV 上做，AIC 跳过（否则会重复写 GM）
-        if ASCEND_IS_AIC
-        {
-            return;
-        }
         LocalTensor<float> a = b0_.Get<float>();
         Duplicate(a, 0.0f, N_);
         PipeBarrier<PIPE_V>();
@@ -934,11 +894,6 @@ class FftConv1dFftGm
     // 因果卷积取线性卷积前 L 点，偏移为 0
     __aicore__ inline void StoreOutG(uint64_t yOff)
     {
-        // 纯 Vector 工作：只在 AIV 上做，AIC 跳过（否则会重复写 GM）
-        if ASCEND_IS_AIC
-        {
-            return;
-        }
         LocalTensor<float> a = b0_.Get<float>();
         LoadG(a, Buf(XR));
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
