@@ -5,32 +5,21 @@
  *       （因果 depthwise 卷积，通道独立，不做通道间求和）
  *       flip_kernel=1 时为 corr 语义（等价于 kernel 时域翻转），见 §3。
  *
- * 两条路径（host tiling 静态分派，kernel 侧不做动态判断）：
- *   ALGO_DIRECT：K < 64，直接因果卷积，纯 Vector
- *   ALGO_FFT   ：K >= 64，四步 Cooley-Tukey，Cube 做 GEMM + Vector 做旋转因子/逐点乘
+ * 三条路径（host tiling 静态分派，kernel 侧不做动态判断）：
+ *   ALGO_DIRECT：K < 64 或 N_fft > 4096，直接因果卷积，纯 Vector
+ *   ALGO_FFT   ：N_fft <= 1024，四步 Cooley-Tukey，数据常驻 UB，
+ *                Matmul 的 A/B 在 VECOUT、C 在 VECIN，Cube 全程不碰 GM
+ *   ALGO_FFT_GM：1024 < N_fft <= 4096，数据放 GM，运算整块经 UB 中转
  *
  * v1 的分解取 N 为 4 的幂 => N1 = N2 = sqrt(N)，于是：
  *   - D1 与 D2 是同一个矩阵 D（DFT 矩阵对称，且 N1==N2）
  *   - 12 次 GEMM 形状统一为 (M=N1, K=N1, N=N1)，共用一个 Matmul 对象与一套 TCubeTiling
  * 数值路径已在 python/fft_conv1d_four_step.py 的 plan_v1 中逐步验证。
  */
-// ---------------------------------------------------------------------------
-// Cube 开关：0 = Vector 版矩阵乘（Axpy 循环，当前已验证数值正确）
-//            1 = Cube 版矩阵乘（Matmul 高阶 API，UB 进 / UB 出）
-// 只影响 MatMulUB 一个函数，其余结构完全相同，因此可以一键 A/B 对照。
-// 注意：Matmul 的 A/B 支持 TPosition::VECOUT、C 支持 TPosition::VECIN，
-//       操作数直接用 UB 上的 LocalTensor，不需要经过 GM。
-// ---------------------------------------------------------------------------
-#define FFT_CONV1D_USE_CUBE 0
-
-// FFT-GM 修复仍需在目标 CANN/910B 上完成编译与精度验证。
-// 置 0 时整段不参与编译；必须与 host 的 FFT_CONV1D_ENABLE_GM 保持一致。
-#define FFT_CONV1D_ENABLE_GM_KERNEL 1
 
 #include "kernel_operator.h"
 
-// 必须无条件包含：自动生成的 TilingData 里含 TCubeTiling 字段，
-// 即使 USE_CUBE=0 也需要这个类型可见。
+// TilingData 里含 TCubeTiling 字段，且两条 FFT 路径都使用 Matmul
 #include "lib/matmul_intf.h"
 
 using namespace AscendC;
@@ -46,28 +35,6 @@ constexpr int32_t VEC_CHUNK = 2048;  // Vector 逐点运算的分块长度（flo
 constexpr int32_t TMP_BUF_BYTES = 8192; // Cos/Sin/Fmod 需要的 sharedTmpBuffer
 constexpr float TWO_PI = 6.283185307179586f;
 
-// ---------------------------------------------------------------------------
-// 优化开关：Cube -> Vector 边界是否插全局栅栏
-// ---------------------------------------------------------------------------
-// 原实现在 Forward/Inverse/Pointwise 里每个 Cube->Vector 边界都调 SyncAll()，
-// 每行 15 次全局栅栏。这是保守写法，两条依据说明它可以去掉：
-//   1. IterateAll 模板默认 sync=true，文档明确“需要同步等待 IterateAll 执行结束”，
-//      Cube/Vector 的握手由 Matmul API 自己完成；
-//   2. 阶段 2 每个核只读写自己的 scratch（offScr_ 按 blockIdx 分片），无跨核依赖，
-//      全局栅栏在这里没有任何语义作用。
-// 真正需要的跨核栅栏只有两处，保留在 Process() 里：常量表就绪、kernel 频谱就绪。
-//
-// 若去栅栏后 FFT 路径数值出错，把下面这行改回 true 即可完全恢复原行为，
-// 从而确认问题是否出在 Cube 写 GM 对 Vector 的可见性上。
-constexpr bool CONSERVATIVE_SYNC = false;
-
-__aicore__ inline void CubeVecSync()
-{
-    if (CONSERVATIVE_SYNC)
-    {
-        SyncAll<false>();
-    }
-}
 
 // ---------------------------------------------------------------------------
 // MIX 1:2 下把 AIC 与两个 AIV 映射到同一个逻辑 block 号
@@ -255,15 +222,14 @@ class FftConv1dDirect
 class FftConv1dFft
 {
   public:
-#if FFT_CONV1D_USE_CUBE
     // 12 次矩阵乘形状统一为 (N1, N1, N1)，共用一个对象。
-    // A/B 放 VECOUT、C 放 VECIN => 全程 UB，不落 GM。
+    // A/B 放 VECOUT、C 放 VECIN => 全程 UB，不落 GM，
+    // 因而不存在 Cube 写 GM 对 Vector 的可见性问题（GM 版才需要处理那个）。
     Matmul<MatmulType<TPosition::VECOUT, CubeFormat::ND, float>,
            MatmulType<TPosition::VECOUT, CubeFormat::ND, float>,
            MatmulType<TPosition::VECIN, CubeFormat::ND, float>,
            MatmulType<TPosition::GM, CubeFormat::ND, float>>
         mm_;
-#endif
 
     __aicore__ inline FftConv1dFft()
     {
@@ -391,36 +357,16 @@ class FftConv1dFft
     // UB 内的 [N1,N1] 矩阵乘：C = A @ B，用 Axpy 逐行累加
     // C[i][:] = sum_k A[i][k] * B[k][:]
     // 每次 Axpy 处理一整行（N1 个 float），偏移 i*N1 / k*N1 都是 N1 的倍数，
-    // N1 ∈ {16,32} 均为 8 的倍数 => 首地址天然 32B 对齐。
+    // N1 ∈ {16,32,64} 均为 8 的倍数 => 首地址天然 32B 对齐。
     // ------------------------------------------------------------------
     __aicore__ inline void MatMulUB(const LocalTensor<float> &c, const LocalTensor<float> &a,
                                     const LocalTensor<float> &b)
     {
-#if FFT_CONV1D_USE_CUBE
-        // Cube 版：A/B 从 UB(VECOUT) 送入，C 直接写回 UB(VECIN)
         mm_.SetTensorA(a);
         mm_.SetTensorB(b);
         mm_.IterateAll(c);
         mm_.End();
         PipeBarrier<PIPE_ALL>();
-#else
-        // Vector 版：C[i][:] = sum_k A[i][k] * B[k][:]
-        // 每次 Axpy 处理一整行（N1 个 float），偏移 i*N1 / k*N1 都是 N1 的倍数，
-        // N1 ∈ {16,32} 均为 8 的倍数 => 首地址天然 32B 对齐。
-        // a 由上一步 Vector 运算写出，标量单元读它之前必须同步。
-        SetFlag<HardEvent::V_S>(EVENT_ID0);
-        WaitFlag<HardEvent::V_S>(EVENT_ID0);
-        for (int32_t i = 0; i < N1_; ++i)
-        {
-            Duplicate(c[i * N1_], 0.0f, N1_);
-            PipeBarrier<PIPE_V>();
-            for (int32_t k = 0; k < N1_; ++k)
-            {
-                Axpy(c[i * N1_], b[k * N1_], a.GetValue(i * N1_ + k), N1_);
-            }
-            PipeBarrier<PIPE_V>();
-        }
-#endif
     }
 
     // (ar,ai) *= (br,bi)，conjB 时用 (br,-bi)。4 次实乘，数值最稳。
@@ -566,7 +512,6 @@ class FftConv1dFft
     int32_t B_, H_, L_, K_, N_, N1_, cores_;
 };
 
-#if FFT_CONV1D_ENABLE_GM_KERNEL
 // ============================================================================
 // 路径三：FFT-GM
 // ============================================================================
@@ -933,7 +878,6 @@ class FftConv1dFftGm
     int32_t B_, H_, L_, K_, N_, N1_, cores_;
 };
 
-#endif // FFT_CONV1D_ENABLE_GM_KERNEL
 
 // ============================================================================
 // kernel 入口
@@ -960,7 +904,6 @@ extern "C" __global__ __aicore__ void fft_conv1d(GM_ADDR x, GM_ADDR kernel, GM_A
         op.Init(&pipe, x, kernel, y, workspace, tilingData);
         op.Process();
     }
-#if FFT_CONV1D_ENABLE_GM_KERNEL
     else if (tilingData.algo == ALGO_FFT_GM)
     {
         // GM 版：中间结果落 GM，当前 UB 预算支持 N=4096
@@ -978,30 +921,19 @@ extern "C" __global__ __aicore__ void fft_conv1d(GM_ADDR x, GM_ADDR kernel, GM_A
         op.Init(&pipe, x, kernel, y, workspace, tilingData);
         op.Process();
     }
-#endif
     else
     {
         // UB 常驻版：已验证正确的基线，小 N 走这里
         FftConv1dFft op;
-#if FFT_CONV1D_USE_CUBE
         REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), op.mm_, &tilingData.cubeTiling);
         if ASCEND_IS_AIV
         {
+            // 每组只让 sub-block 0 跑数据流；sub-block 1 完成 KFC 客户端注册后退出
             if (!IsPrimaryAiv())
             {
                 return;
             }
         }
-#else
-        if ASCEND_IS_AIC
-        {
-            return;
-        }
-        if (!IsPrimaryAiv())
-        {
-            return;
-        }
-#endif
         op.Init(&pipe, x, kernel, y, workspace, tilingData);
         op.Process();
     }

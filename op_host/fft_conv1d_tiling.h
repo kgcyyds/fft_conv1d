@@ -17,32 +17,24 @@ constexpr uint32_t FFT_CONV1D_ALGO_DIRECT = 0; // 直接因果卷积（Vector）
 constexpr uint32_t FFT_CONV1D_ALGO_FFT = 1;     // UB 常驻（N <= FFT_CONV1D_MAX_NFFT_UB）
 constexpr uint32_t FFT_CONV1D_ALGO_FFT_GM = 2;  // GM 版（更大的 N）
 
-// 调试开关：强制单核（blockDim = 1）。
-// 多核路径（UB 版 + Cube）已实测验证通过，因此默认关闭。
-// 保留这个开关是因为它在定位问题时价值很高：一旦怀疑某个 bug 与多核分片有关，
-// 打开它就能一次性排除 scratch 分片、跨核共享、栅栏计数三类因素。
-// 注意：单核 != 单执行单元。MIX 1:2 下 blockDim=1 会启动 1 个 AIC 与
-//       2 个 AIV；当前只让 sub-block 0 执行用户数据流。
-constexpr uint32_t FFT_CONV1D_FORCE_SINGLE_CORE = 0;
-
-// v1 约束（同时写入 host 校验与文档，不做隐式假设）
-// FFT 路径 N_fft 上限。重写版把中间结果全部放 UB：12 个长度 N 的缓冲，
-// N=1024 时 48KB（很宽裕），N=4096 时 192KB（放不下）。故上限取 1024。
-// 超出时 host 自动回退 DIRECT —— DIRECT 对任意 K 数值都正确，功能覆盖不减。
-constexpr uint32_t FFT_CONV1D_MAX_NFFT_UB = 1024;  // UB 常驻上限 => N1 = 32（48KB）
-// GM 版上限：Cube 的 A/B/C 与 Vector 中间结果以 GM 为后备存储；
-// 复数逐点乘仍需同时驻留 6 个长度 N 的 UB 缓冲，N=4096 时连同索引和
-// shared tmp 共占 107008B，因此上限取 4096。
-// 超出由 host 回退 DIRECT（数值仍正确）。
-// FFT-GM 开关。0 = 关闭（N>1024 的 shape 回退 DIRECT，数值正确但较慢）
-//              1 = 启用
-// 当前置 1：启用 FFT-GM；若关闭，N>1024 的 shape 自动回退 DIRECT。
-constexpr uint32_t FFT_CONV1D_ENABLE_GM = 1;
-
-constexpr uint32_t FFT_CONV1D_MAX_NFFT =
-    FFT_CONV1D_ENABLE_GM ? 4096u : FFT_CONV1D_MAX_NFFT_UB; // GM 版上限 => N1 = 64
-constexpr uint32_t FFT_CONV1D_GM_BUFS = 12;        // GM 版每核缓冲个数，与 kernel 一致
-constexpr uint32_t FFT_CONV1D_FFT_MIN_K = 64;    // K 小于该值走 direct（见设计文档 §9）
+// ---------------------------------------------------------------------------
+// 算法分派的边界常量（都由硬件容量推导，不是经验值）
+// ---------------------------------------------------------------------------
+// N_fft 取 >= L+K-1 的最小 4 的幂，故 N1 = N2 = sqrt(N_fft)。
+//
+// FFT-UB：12 个长度 N 的缓冲常驻 UB（Dr Di Tr Ti Kfr Kfi Xr Xi Yr Yi Zr Zi）
+//         N=1024 -> 12*1024*4 = 48KB，很宽裕；N=4096 -> 192KB，放不下。
+constexpr uint32_t FFT_CONV1D_MAX_NFFT_UB = 1024;   // => N1 = 32
+//
+// FFT-GM：数据放 GM，运算时整块经 UB 中转。复数逐点乘需同时驻留 6 个长度 N
+//         的缓冲 => N=4096 时 6*4096*4 = 96KB 为上限。
+constexpr uint32_t FFT_CONV1D_MAX_NFFT_GM = 4096;   // => N1 = 64
+//
+// 超过 FFT_CONV1D_MAX_NFFT_GM 的 shape 回退 DIRECT：数值仍然正确，只是更慢，
+// 因此算子支持的 shape 范围不受这些容量上限影响。
+// K 小于该值时直接卷积更快（DIRECT 为 O(L*K) Vector，FFT 为 O(12*N*N1) Cube）。
+// 该分界点来自 docs/02 §9 的代价模型估算，尚未用实测标定。
+constexpr uint32_t FFT_CONV1D_FFT_MIN_K = 64;
 constexpr uint32_t FFT_CONV1D_DIRECT_TILE = 4096; // direct 路径的输出分块长度
 
 // FFT-UB 全部数据常驻 UB；FFT-GM 每核使用 FFT_CONV1D_GM_BUFS 个 GM 缓冲。

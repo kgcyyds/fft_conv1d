@@ -93,19 +93,23 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     const uint32_t nRadix = IsqrtPow4(nFft);
 
     // ---------------- 3. 算法分派 ----------------
-    // FFT 需同时满足：K 足够大（否则 direct 更快）且 N_fft 不超过对应路径上限。
-    // 任一不满足就走 DIRECT —— DIRECT 对任意 shape 都数值正确，只是更慢，
-    // 因此算子支持的 shape 范围不因这个上限而缩小。
-    // 三路分派：
-    //   K < 64                     -> DIRECT（小 K 时直接卷积更快）
-    //   N <= 1024                  -> FFT（UB 常驻，已验证的基线）
-    //   1024 < N <= 4096           -> FFT_GM（GM 后备存储，N=4096）
-    //   N > 4096                   -> DIRECT（兜底，数值仍然正确）
+    // 三个分支的边界都由容量推导（见 fft_conv1d_tiling.h）：
+    //   K < 64                        -> DIRECT   小 K 时直接卷积更快
+    //   N_fft <= 1024                 -> FFT-UB   12 个 N 长缓冲常驻 UB（48KB）
+    //   1024 < N_fft <= 4096          -> FFT-GM   数据放 GM，整块经 UB 中转（96KB）
+    //   N_fft > 4096                  -> DIRECT   兜底，数值仍然正确
+    // 条件直接写在 nFft 上（而不是 need）：nFft 才是决定缓冲大小的量。
     uint32_t algo = FFT_CONV1D_ALGO_DIRECT;
-    if (K >= FFT_CONV1D_FFT_MIN_K && need <= FFT_CONV1D_MAX_NFFT)
+    if (K >= FFT_CONV1D_FFT_MIN_K)
     {
-        algo = (need <= FFT_CONV1D_MAX_NFFT_UB) ? FFT_CONV1D_ALGO_FFT
-                                                : FFT_CONV1D_ALGO_FFT_GM;
+        if (nFft <= FFT_CONV1D_MAX_NFFT_UB)
+        {
+            algo = FFT_CONV1D_ALGO_FFT;
+        }
+        else if (nFft <= FFT_CONV1D_MAX_NFFT_GM)
+        {
+            algo = FFT_CONV1D_ALGO_FFT_GM;
+        }
     }
 
     // ---------------- 4. 多核切分 ----------------
@@ -128,10 +132,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     if (usedCoreNum == 0)
     {
         usedCoreNum = 1;
-    }
-    if (FFT_CONV1D_FORCE_SINGLE_CORE != 0)
-    {
-        usedCoreNum = 1; // 调试期强制单核
     }
     const uint32_t rowsPerCore = CeilDiv(totalRows, usedCoreNum);
 
