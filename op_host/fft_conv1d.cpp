@@ -151,15 +151,17 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         // 操作数位置必须与 kernel 侧 MatmulType **逐个字段一致**，否则 Matmul 会按
         // 错误的搬运路径和缓冲划分工作，结果错误但不报错。
         //
-        // 重设计后两条 FFT 路径用的是同一套配置：A/B 在 VECOUT、C 在 VECIN
-        // （GM 版的“GM”指的是数据的后备存储，Cube 本身只碰 UB）。
+        //   UB 路径  -> A/B 在 VECOUT、C 在 VECIN（Cube 只碰 UB）
+        //   GM 路径  -> A/B/C 全在 GM（与 AscendC-S4 已验证的配置一致）
+        const bool gmPath = (algo == FFT_CONV1D_ALGO_FFT_GM);
+        const auto posAB = gmPath ? matmul_tiling::TPosition::GM
+                                  : matmul_tiling::TPosition::VECOUT;
+        const auto posC = gmPath ? matmul_tiling::TPosition::GM
+                                 : matmul_tiling::TPosition::VECIN;
         matmul_tiling::MatmulApiTiling mmT(ascendcPlatform);
-        mmT.SetAType(matmul_tiling::TPosition::VECOUT, matmul_tiling::CubeFormat::ND,
-                     matmul_tiling::DataType::DT_FLOAT);
-        mmT.SetBType(matmul_tiling::TPosition::VECOUT, matmul_tiling::CubeFormat::ND,
-                     matmul_tiling::DataType::DT_FLOAT);
-        mmT.SetCType(matmul_tiling::TPosition::VECIN, matmul_tiling::CubeFormat::ND,
-                     matmul_tiling::DataType::DT_FLOAT);
+        mmT.SetAType(posAB, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+        mmT.SetBType(posAB, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+        mmT.SetCType(posC, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
         mmT.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
                         matmul_tiling::DataType::DT_FLOAT);
         const int32_t s1 = static_cast<int32_t>(nRadix);

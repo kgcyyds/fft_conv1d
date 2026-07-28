@@ -596,10 +596,11 @@ class FftConv1dFft
 class FftConv1dFftGm
 {
   public:
-    // A/B/C 全在 UB：与已验证的 UB 路径用同一套 MatmulType 配置
-    Matmul<MatmulType<TPosition::VECOUT, CubeFormat::ND, float>,
-           MatmulType<TPosition::VECOUT, CubeFormat::ND, float>,
-           MatmulType<TPosition::VECIN, CubeFormat::ND, float>,
+    // A/B/C 全在 GM —— 与 AscendC-S4 模板中已验证可用的配置一致。
+    // Cube 直接读写 GM，不经 UB 中转。
+    Matmul<MatmulType<TPosition::GM, CubeFormat::ND, float>,
+           MatmulType<TPosition::GM, CubeFormat::ND, float>,
+           MatmulType<TPosition::GM, CubeFormat::ND, float>,
            MatmulType<TPosition::GM, CubeFormat::ND, float>>
         mm_;
 
@@ -643,21 +644,32 @@ class FftConv1dFftGm
     __aicore__ inline void Process()
     {
         BuildTables();
-        // 按通道切核：每核独占若干通道，GM 缓冲按 CoreIdx 分片 => 零跨核共享，无需同步
-        for (int32_t h = CoreIdx(); h < H_; h += cores_)
+        SyncAll(); // 常量表就绪
+
+        // 两层循环的次数对所有核都相同 —— 这是能用 SyncAll 的前提。
+        // 分不到通道的核仍然走完全部流程（在自己的 scratch 上算废数据），
+        // 只是不写回输出，从而保证 SyncAll 调用次数处处一致。
+        const int32_t chPerCore = (H_ + cores_ - 1) / cores_;
+        for (int32_t i = 0; i < chPerCore; ++i)
         {
-            LoadRowG(Buf(XR), wGm_, static_cast<uint64_t>(h) * K_, K_);
+            const int32_t h = CoreIdx() + i * cores_;
+            const bool active = (h < H_);
+            LoadRowG(Buf(XR), wGm_, static_cast<uint64_t>(active ? h : 0) * K_, K_);
             Forward();
             CopyG(Buf(KR), Buf(XR));
             CopyG(Buf(KI), Buf(XI));
+
             for (int32_t b = 0; b < B_; ++b)
             {
-                const int32_t row = b * H_ + h;
+                const int32_t row = active ? (b * H_ + h) : 0;
                 LoadRowG(Buf(XR), xGm_, static_cast<uint64_t>(row) * L_, L_);
                 Forward();
                 CMulG(Buf(XR), Buf(XI), Buf(KR), Buf(KI), false);
                 Inverse();
-                StoreOutG(static_cast<uint64_t>(row) * L_);
+                if (active)
+                {
+                    StoreOutG(static_cast<uint64_t>(row) * L_);
+                }
             }
         }
     }
@@ -739,25 +751,24 @@ class FftConv1dFftGm
     // ---------------- 矩阵乘：GM -> UB -> Cube -> UB -> GM ----------------
     // Cube 的输入输出全在 UB，走的是没有 waitIterateAll 参数的同步重载，
     // 与已验证的 UB 路径完全一致，因此不存在跨核可见性问题。
+    // 矩阵乘：A/B/C 全在 GM，Cube 直接读写。
+    //
+    // 同步方式照搬 AscendC-S4 模板中已验证可用的写法：**SyncAll 夹逼**。
+    //   Vector 写 GM -> SyncAll -> Cube 读写 GM -> SyncAll -> Vector 读 GM
+    // 这里 SyncAll 的作用不是跨核数据同步（本设计每核零共享），
+    // 而是 **AIC 与 AIV 之间的汇合点**。PipeBarrier 做不到这一点：
+    // 它只约束同一个核内部的流水，而 MIX 下 Cube 在 AIC、Vector 在 AIV。
+    //
+    // 前提：调用点必须位于**各核迭代次数相同**的循环内，否则 SyncAll 次数
+    // 不匹配会死锁。Process() 的两层循环为此都改成了固定次数 + active 标志。
     __aicore__ inline void MatMulG(uint64_t c, uint64_t a, uint64_t b)
     {
-        LocalTensor<float> ua = b0_.Get<float>();
-        LocalTensor<float> ub = b1_.Get<float>();
-        LocalTensor<float> uc = b2_.Get<float>();
-        LoadG(ua, a);
-        LoadG(ub, b);
-        // GM 路径独有的同步问题：A/B 是被 **MTE2**（DataCopyPad GM->UB）写进 UB 的，
-        // 而 UB 路径里它们是被 Vector 写的。Matmul API 管的是 V->Cube 这条链，
-        // MTE2->Cube 没人保证，必须自己插全流水栅栏。
-        PipeBarrier<PIPE_ALL>();
-        mm_.SetTensorA(ua);
-        mm_.SetTensorB(ub);
-        mm_.IterateAll(uc); // UB -> UB，同步重载
+        SyncAll();
+        mm_.SetTensorA(wsGm_[a]);
+        mm_.SetTensorB(wsGm_[b]);
+        mm_.IterateAll(wsGm_[c]);
         mm_.End();
-        // 同理，输出侧的消费者是 **MTE3**（DataCopyPad UB->GM）而不是 Vector，
-        // Cube->MTE3 也需要显式栅栏。
-        PipeBarrier<PIPE_ALL>();
-        StoreG(c, uc);
+        SyncAll();
     }
 
     // ---------------- 逐点运算：整块进出 ----------------
