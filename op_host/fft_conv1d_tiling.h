@@ -26,9 +26,14 @@ constexpr uint32_t FFT_CONV1D_ALGO_FFT_GM = 2;  // GM 版（更大的 N）
 //         N=1024 -> 12*1024*4 = 48KB，很宽裕；N=4096 -> 192KB，放不下。
 constexpr uint32_t FFT_CONV1D_MAX_NFFT_UB = 1024;   // => N1 = 32
 //
-// FFT-GM：数据放 GM，运算时整块经 UB 中转。复数逐点乘需同时驻留 6 个长度 N
-//         的缓冲 => N=4096 时 6*4096*4 = 96KB 为上限。
-constexpr uint32_t FFT_CONV1D_MAX_NFFT_GM = 4096;   // => N1 = 64
+// FFT-GM：数据放 GM；逐点运算按 VEC_CHUNK(2048) 分块经 UB，
+//         矩阵乘 A/B/C 全在 GM（Cube 直接读写，不占 UB）。
+//         => UB 占用恒为 6*2048*4 + 8KB tmp + 4*N1*4 ≈ 60KB，**与 N 无关**。
+//         上限改由这三条决定，取最紧的一条：
+//           a) N1 = sqrt(N) 要能被 Matmul tiling 接受（N=16384 -> N1=128，可行）
+//           b) Row() 逐行生成时 N1 <= VEC_CHUNK（128 << 2048，宽裕）
+//           c) workspace = 12 * N * 核数 * 4B（N=16384、20 核约 15.7MB）
+constexpr uint32_t FFT_CONV1D_MAX_NFFT_GM = 16384;  // => N1 = 128
 //
 // 超过 FFT_CONV1D_MAX_NFFT_GM 的 shape 回退 DIRECT：数值仍然正确，只是更慢，
 // 因此算子支持的 shape 范围不受这些容量上限影响。

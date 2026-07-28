@@ -566,13 +566,16 @@ class FftConv1dFftGm
 
         if ASCEND_IS_AIV
         {
-            const int32_t nb = N_ * sizeof(float);
-            pipe->InitBuffer(b0_, nb);
-            pipe->InitBuffer(b1_, nb);
-            pipe->InitBuffer(b2_, nb);
-            pipe->InitBuffer(b3_, nb);
-            pipe->InitBuffer(b4_, nb);
-            pipe->InitBuffer(b5_, nb);
+            constexpr int32_t kChunkBytes = VEC_CHUNK * sizeof(float);
+            // 逐点运算按 VEC_CHUNK 分块，UB 占用与 N_fft **无关**：
+            // 6 * 2048 * 4B = 48KB，无论 N 多大都是这个数。
+            // 矩阵乘的 A/B/C 都在 GM（Cube 直接读写），不占 UB。
+            pipe->InitBuffer(b0_, kChunkBytes);
+            pipe->InitBuffer(b1_, kChunkBytes);
+            pipe->InitBuffer(b2_, kChunkBytes);
+            pipe->InitBuffer(b3_, kChunkBytes);
+            pipe->InitBuffer(b4_, kChunkBytes);
+            pipe->InitBuffer(b5_, kChunkBytes);
             pipe->InitBuffer(bIdx_, AlignUp8(N1_) * sizeof(float));
             pipe->InitBuffer(bAng_, AlignUp8(N1_) * sizeof(float));
             pipe->InitBuffer(bQ_, AlignUp8(N1_) * sizeof(float));
@@ -611,22 +614,22 @@ class FftConv1dFftGm
     }
 
     // ---------------- GM <-> UB 的整块搬运（长度恒为 N，UB 偏移恒为 0）----------------
-    __aicore__ inline void LoadG(const LocalTensor<float> &d, uint64_t off)
+    __aicore__ inline void LoadG(const LocalTensor<float> &d, uint64_t off, int32_t len)
     {
         SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
         WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-        DataCopyExtParams cp{1, static_cast<uint32_t>(N_) * 4U, 0, 0, 0};
+        DataCopyExtParams cp{1, static_cast<uint32_t>(len) * 4U, 0, 0, 0};
         DataCopyPadExtParams<float> pad{false, 0, 0, 0};
         DataCopyPad(d, wsGm_[off], cp, pad);
         SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
         WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
     }
 
-    __aicore__ inline void StoreG(uint64_t off, const LocalTensor<float> &s)
+    __aicore__ inline void StoreG(uint64_t off, const LocalTensor<float> &s, int32_t len)
     {
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        DataCopyExtParams cp{1, static_cast<uint32_t>(N_) * 4U, 0, 0, 0};
+        DataCopyExtParams cp{1, static_cast<uint32_t>(len) * 4U, 0, 0, 0};
         DataCopyPad(wsGm_[off], s, cp);
         SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
         WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
@@ -637,18 +640,21 @@ class FftConv1dFftGm
 
     __aicore__ inline void CopyG(uint64_t dst, uint64_t src)
     {
-        if ASCEND_IS_AIC
-        {
-            return;
-        }
         LocalTensor<float> t = b0_.Get<float>();
-        LoadG(t, src);
-        StoreG(dst, t);
+        for (int32_t o = 0; o < N_; o += VEC_CHUNK)
+        {
+            const int32_t len = MinU(VEC_CHUNK, N_ - o);
+            LoadG(t, src + o, len);
+            StoreG(dst + o, t, len);
+        }
     }
 
     // ---------------- 常量表：整张在 UB 生成后一次性落 GM ----------------
     // 角度算法与已验证的 UB 路径逐字相同：先算精确整数 k*n，再乘同一个 step，
     // 保证 D[k][n] == D[n][k] 精确成立（“D 对称所以不用转置”是本方案的前提）。
+    // 常量表：**逐行**生成后立即落 GM，每行只有 N1 个元素。
+    // 原先是整张表（N 个元素）建在 UB 再一次性落盘，那需要 4 个 N 长缓冲，
+    // 正是 N_fft 上限的来源之一。改成逐行后 UB 占用与 N 无关。
     __aicore__ inline void BuildTables()
     {
         if ASCEND_IS_AIC
@@ -657,23 +663,22 @@ class FftConv1dFftGm
         }
         LocalTensor<float> idx = bIdx_.Get<float>();
         LocalTensor<float> ang = bAng_.Get<float>();
+        LocalTensor<float> re = b0_.Get<float>();
+        LocalTensor<float> im = b1_.Get<float>();
         LocalTensor<uint8_t> tmp = bTmp_.Get<uint8_t>();
-        LocalTensor<float> dr = b0_.Get<float>();
-        LocalTensor<float> di = b1_.Get<float>();
-        LocalTensor<float> tr = b2_.Get<float>();
-        LocalTensor<float> ti = b3_.Get<float>();
 
         CreateVecIndex(idx, 0.0f, N1_);
         PipeBarrier<PIPE_V>();
         for (int32_t k = 0; k < N1_; ++k)
         {
-            Row(dr[k * N1_], di[k * N1_], idx, ang, tmp, k, N1_);
-            Row(tr[k * N1_], ti[k * N1_], idx, ang, tmp, k, N_);
+            const uint64_t off = static_cast<uint64_t>(k) * N1_;
+            Row(re, im, idx, ang, tmp, k, N1_);
+            StoreG(Buf(DR) + off, re, N1_);
+            StoreG(Buf(DI) + off, im, N1_);
+            Row(re, im, idx, ang, tmp, k, N_);
+            StoreG(Buf(TR) + off, re, N1_);
+            StoreG(Buf(TI) + off, im, N1_);
         }
-        StoreG(Buf(DR), dr);
-        StoreG(Buf(DI), di);
-        StoreG(Buf(TR), tr);
-        StoreG(Buf(TI), ti);
     }
 
     __aicore__ inline void Row(const LocalTensor<float> &re, const LocalTensor<float> &im,
@@ -731,30 +736,30 @@ class FftConv1dFftGm
     // kind: 0 = a+b, 1 = a-b, 2 = (a+b)*s
     __aicore__ inline void BinG(uint64_t dst, uint64_t oa, uint64_t ob, int32_t kind, float s)
     {
-        if ASCEND_IS_AIC
-        {
-            return;
-        }
         LocalTensor<float> a = b0_.Get<float>();
         LocalTensor<float> b = b1_.Get<float>();
         LocalTensor<float> c = b2_.Get<float>();
-        LoadG(a, oa);
-        LoadG(b, ob);
-        if (kind == 1)
+        for (int32_t o = 0; o < N_; o += VEC_CHUNK)
         {
-            Sub(c, a, b, N_);
-        }
-        else
-        {
-            Add(c, a, b, N_);
-        }
-        PipeBarrier<PIPE_V>();
-        if (kind == 2)
-        {
-            Muls(c, c, s, N_);
+            const int32_t len = MinU(VEC_CHUNK, N_ - o);
+            LoadG(a, oa + o, len);
+            LoadG(b, ob + o, len);
+            if (kind == 1)
+            {
+                Sub(c, a, b, len);
+            }
+            else
+            {
+                Add(c, a, b, len);
+            }
             PipeBarrier<PIPE_V>();
+            if (kind == 2)
+            {
+                Muls(c, c, s, len);
+                PipeBarrier<PIPE_V>();
+            }
+            StoreG(dst + o, c, len);
         }
-        StoreG(dst, c);
     }
 
     // (ar,ai) *= (br,bi)，conjB 时用 (br,-bi)。4 次实乘。
@@ -771,37 +776,41 @@ class FftConv1dFftGm
         LocalTensor<float> bi = b3_.Get<float>();
         LocalTensor<float> t0 = b4_.Get<float>();
         LocalTensor<float> t1 = b5_.Get<float>();
-        LoadG(ar, oar);
-        LoadG(ai, oai);
-        LoadG(br, obr);
-        LoadG(bi, obi);
-        Mul(t0, ar, br, N_); // ar*br
-        Mul(t1, ai, bi, N_); // ai*bi
-        PipeBarrier<PIPE_V>();
-        if (conjB)
+        for (int32_t o = 0; o < N_; o += VEC_CHUNK)
         {
-            Add(t0, t0, t1, N_); // conj 实部 = ar*br + ai*bi
+            const int32_t len = MinU(VEC_CHUNK, N_ - o);
+            LoadG(ar, oar + o, len);
+            LoadG(ai, oai + o, len);
+            LoadG(br, obr + o, len);
+            LoadG(bi, obi + o, len);
+            Mul(t0, ar, br, len); // ar*br
+            Mul(t1, ai, bi, len); // ai*bi
+            PipeBarrier<PIPE_V>();
+            if (conjB)
+            {
+                Add(t0, t0, t1, len); // conj 实部 = ar*br + ai*bi
+            }
+            else
+            {
+                Sub(t0, t0, t1, len); // 实部 = ar*br - ai*bi
+            }
+            PipeBarrier<PIPE_V>();
+            Mul(t1, ar, bi, len); // ar*bi
+            PipeBarrier<PIPE_V>();
+            Mul(ar, ai, br, len); // ai*br（ar 已不再需要，安全复用）
+            PipeBarrier<PIPE_V>();
+            if (conjB)
+            {
+                Sub(t1, ar, t1, len); // conj 虚部 = ai*br - ar*bi
+            }
+            else
+            {
+                Add(t1, t1, ar, len); // 虚部 = ar*bi + ai*br
+            }
+            PipeBarrier<PIPE_V>();
+            StoreG(oar + o, t0, len);
+            StoreG(oai + o, t1, len);
         }
-        else
-        {
-            Sub(t0, t0, t1, N_); // 实部 = ar*br - ai*bi
-        }
-        PipeBarrier<PIPE_V>();
-        Mul(t1, ar, bi, N_); // ar*bi
-        PipeBarrier<PIPE_V>();
-        Mul(ar, ai, br, N_); // ai*br（ar 已不再需要）
-        PipeBarrier<PIPE_V>();
-        if (conjB)
-        {
-            Sub(t1, ar, t1, N_); // conj 虚部 = ai*br - ar*bi
-        }
-        else
-        {
-            Add(t1, t1, ar, N_); // 虚部 = ar*bi + ai*br
-        }
-        PipeBarrier<PIPE_V>();
-        StoreG(oar, t0);
-        StoreG(oai, t1);
     }
 
     // ---------------- 正/逆变换（与已验证的 UB 路径逐步对应）----------------
@@ -834,6 +843,7 @@ class FftConv1dFftGm
 
     // ---------------- 行搬运 ----------------
     // dst = [src 的 count 个元素, 0 补齐到 N]
+    // dst = [src 的 count 个元素, 0 补齐到 N]，按 VEC_CHUNK 分块
     __aicore__ inline void LoadRowG(uint64_t dst, const GlobalTensor<float> &src, uint64_t off,
                                     int32_t count)
     {
@@ -842,18 +852,27 @@ class FftConv1dFftGm
             return;
         }
         LocalTensor<float> a = b0_.Get<float>();
-        Duplicate(a, 0.0f, N_);
-        PipeBarrier<PIPE_V>();
-        SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
-        WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-        DataCopyExtParams cp{1, static_cast<uint32_t>(count) * 4U, 0, 0, 0};
-        DataCopyPadExtParams<float> pad{false, 0, 0, 0};
-        DataCopyPad(a, src[off], cp, pad);
-        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        StoreG(dst, a);
+        for (int32_t o = 0; o < N_; o += VEC_CHUNK)
+        {
+            const int32_t len = MinU(VEC_CHUNK, N_ - o);
+            Duplicate(a, 0.0f, len);
+            PipeBarrier<PIPE_V>();
+            const int32_t valid = (o < count) ? MinU(len, count - o) : 0;
+            if (valid > 0)
+            {
+                SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
+                WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
+                DataCopyExtParams cp{1, static_cast<uint32_t>(valid) * 4U, 0, 0, 0};
+                DataCopyPadExtParams<float> pad{false, 0, 0, 0};
+                DataCopyPad(a, src[off + o], cp, pad);
+                SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            }
+            StoreG(dst + o, a, len);
+        }
     }
 
+    // 因果卷积取线性卷积前 L 点，偏移为 0
     // 因果卷积取线性卷积前 L 点，偏移为 0
     __aicore__ inline void StoreOutG(uint64_t yOff)
     {
@@ -862,13 +881,17 @@ class FftConv1dFftGm
             return;
         }
         LocalTensor<float> a = b0_.Get<float>();
-        LoadG(a, Buf(XR));
-        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        DataCopyExtParams cp{1, static_cast<uint32_t>(L_) * 4U, 0, 0, 0};
-        DataCopyPad(yGm_[yOff], a, cp);
-        SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+        for (int32_t o = 0; o < L_; o += VEC_CHUNK)
+        {
+            const int32_t len = MinU(VEC_CHUNK, L_ - o);
+            LoadG(a, Buf(XR) + o, len);
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            DataCopyExtParams cp{1, static_cast<uint32_t>(len) * 4U, 0, 0, 0};
+            DataCopyPad(yGm_[yOff + o], a, cp);
+            SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+        }
     }
 
     GlobalTensor<float> xGm_, wGm_, yGm_, wsGm_;
