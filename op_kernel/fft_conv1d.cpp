@@ -630,6 +630,8 @@ class FftConv1dFftGm
             pipe->InitBuffer(b5_, nb);
             pipe->InitBuffer(bIdx_, AlignUp8(N1_) * sizeof(float));
             pipe->InitBuffer(bAng_, AlignUp8(N1_) * sizeof(float));
+            pipe->InitBuffer(bQ_, AlignUp8(N1_) * sizeof(float));
+            pipe->InitBuffer(bQi_, AlignUp8(N1_) * sizeof(int32_t));
             pipe->InitBuffer(bTmp_, TMP_BUF_BYTES);
         }
     }
@@ -733,9 +735,36 @@ class FftConv1dFftGm
                                const LocalTensor<float> &idx, const LocalTensor<float> &ang,
                                const LocalTensor<uint8_t> &tmp, int32_t k, int32_t mod)
     {
-        Muls(ang, idx, static_cast<float>(k), N1_);              // k*n（精确整数）
+        // ---- 1) prod = k*n，精确整数（<= (N1-1)^2 < 2^24，fp32 可精确表示）----
+        Muls(ang, idx, static_cast<float>(k), N1_);
         PipeBarrier<PIPE_V>();
-        Muls(ang, ang, -TWO_PI / static_cast<float>(mod), N1_);  // 乘同一个 step
+
+        // ---- 2) 角度规约：rem = prod mod M ----
+        // 必须做规约，否则角度最大到 2π(N1-1)^2/N1（N1=64 时约 390 rad）。
+        // 设备上的 Cos/Sin 是向量化实现，对大幅角精度会显著劣化 ——
+        // 这正是 N1=32 能过、N1=64 偏差的原因。
+        //
+        // 不能用标量取模（AICore 标量单元无硬件除法器），也不依赖 Fmod。
+        // M 是 2 的幂，故 1/M 在 fp32 中精确，下面这串全部无舍入误差：
+        //   q = prod * (1/M) -> floor -> rem = prod - floor*M
+        // Cast 是基础 API（精度转换指令），比数学库更底层可靠。
+        {
+            LocalTensor<float> q = bQ_.Get<float>();
+            LocalTensor<int32_t> qi = bQi_.Get<int32_t>();
+            Muls(q, ang, 1.0f / static_cast<float>(mod), N1_);
+            PipeBarrier<PIPE_V>();
+            Cast(qi, q, RoundMode::CAST_FLOOR, N1_);
+            PipeBarrier<PIPE_V>();
+            Cast(q, qi, RoundMode::CAST_NONE, N1_);
+            PipeBarrier<PIPE_V>();
+            Muls(q, q, static_cast<float>(mod), N1_);
+            PipeBarrier<PIPE_V>();
+            Sub(ang, ang, q, N1_); // rem ∈ [0, M)
+            PipeBarrier<PIPE_V>();
+        }
+
+        // ---- 3) 乘同一个 step：保证 D[k][n] == D[n][k] 精确成立 ----
+        Muls(ang, ang, -TWO_PI / static_cast<float>(mod), N1_); // |角度| < 2π
         PipeBarrier<PIPE_V>();
         Cos(re, ang, tmp, N1_); // dst != src
         Sin(im, ang, tmp, N1_);
@@ -899,7 +928,7 @@ class FftConv1dFftGm
 
     GlobalTensor<float> xGm_, wGm_, yGm_, wsGm_;
     TBuf<TPosition::VECCALC> b0_, b1_, b2_, b3_, b4_, b5_;
-    TBuf<TPosition::VECCALC> bIdx_, bAng_, bTmp_;
+    TBuf<TPosition::VECCALC> bIdx_, bAng_, bQ_, bQi_, bTmp_;
     uint64_t base_;
     int32_t B_, H_, L_, K_, N_, N1_, cores_;
 };
