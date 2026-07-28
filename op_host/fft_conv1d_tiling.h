@@ -21,8 +21,8 @@ constexpr uint32_t FFT_CONV1D_ALGO_FFT_GM = 2;  // GM 版（更大的 N）
 // 多核路径（UB 版 + Cube）已实测验证通过，因此默认关闭。
 // 保留这个开关是因为它在定位问题时价值很高：一旦怀疑某个 bug 与多核分片有关，
 // 打开它就能一次性排除 scratch 分片、跨核共享、栅栏计数三类因素。
-// 注意：单核 != 单执行单元。MIX 模式下 blockDim=1 仍有 1 个 AIC + 2 个 AIV，
-//       AIV 的 GetBlockIdx() 仍会取到 0 和 1，所以 CoreIdx() 的除法始终必要。
+// 注意：单核 != 单执行单元。MIX 1:2 下 blockDim=1 会启动 1 个 AIC 与
+//       2 个 AIV；当前只让 sub-block 0 执行用户数据流。
 constexpr uint32_t FFT_CONV1D_FORCE_SINGLE_CORE = 0;
 
 // v1 约束（同时写入 host 校验与文档，不做隐式假设）
@@ -30,13 +30,13 @@ constexpr uint32_t FFT_CONV1D_FORCE_SINGLE_CORE = 0;
 // N=1024 时 48KB（很宽裕），N=4096 时 192KB（放不下）。故上限取 1024。
 // 超出时 host 自动回退 DIRECT —— DIRECT 对任意 K 数值都正确，功能覆盖不减。
 constexpr uint32_t FFT_CONV1D_MAX_NFFT_UB = 1024;  // UB 常驻上限 => N1 = 32（48KB）
-// GM 版上限：重设计后 Cube 永不碰 GM，运算整块经 UB 中转，
-// 复数逐点乘需同时驻留 6 个长度 N 的 UB 缓冲 => N=4096 时 6*16KB=96KB 为上限。
+// GM 版上限：Cube 的 A/B/C 与 Vector 中间结果以 GM 为后备存储；
+// 复数逐点乘仍需同时驻留 6 个长度 N 的 UB 缓冲，N=4096 时连同索引和
+// shared tmp 共占 107008B，因此上限取 4096。
 // 超出由 host 回退 DIRECT（数值仍正确）。
 // FFT-GM 开关。0 = 关闭（N>1024 的 shape 回退 DIRECT，数值正确但较慢）
 //              1 = 启用
-// 当前置 0：FFT-GM 尚未验证通过，关闭后算子对所有 shape 都是正确的。
-// 代码保留在 op_kernel 里，拿到观测手段后再打开排查。
+// 当前置 1：启用 FFT-GM；若关闭，N>1024 的 shape 自动回退 DIRECT。
 constexpr uint32_t FFT_CONV1D_ENABLE_GM = 1;
 
 constexpr uint32_t FFT_CONV1D_MAX_NFFT =
@@ -45,7 +45,7 @@ constexpr uint32_t FFT_CONV1D_GM_BUFS = 12;        // GM 版每核缓冲个数�
 constexpr uint32_t FFT_CONV1D_FFT_MIN_K = 64;    // K 小于该值走 direct（见设计文档 §9）
 constexpr uint32_t FFT_CONV1D_DIRECT_TILE = 4096; // direct 路径的输出分块长度
 
-// 重写后 FFT 路径全部数据常驻 UB，不再需要 GM scratch
+// FFT-UB 全部数据常驻 UB；FFT-GM 每核使用 FFT_CONV1D_GM_BUFS 个 GM 缓冲。
 
 BEGIN_TILING_DATA_DEF(FftConv1dTilingData)
 TILING_DATA_FIELD_DEF(uint32_t, batch);      // B

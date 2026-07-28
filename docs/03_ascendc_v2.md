@@ -1,220 +1,185 @@
-# fft_conv1d 阶段 3/5：AscendC 实现与优化记录
+# fft_conv1d 当前 AscendC 实现
 
-> 对应代码：`op_host/fft_conv1d.cpp`、`op_host/fft_conv1d_tiling.h`、`op_kernel/fft_conv1d.cpp`
-> 逻辑守护测试：`tests/test_stage3_kernel_logic.py`（229 个用例全过，无需 NPU）
+> 对应源码：`op_host/fft_conv1d.cpp`、`op_host/fft_conv1d_tiling.h`、
+> `op_kernel/fft_conv1d.cpp`
+>
+> 目标环境：Ascend 910B / Atlas A2，CANN 8.5
 
----
+## 1. 接口与语义
 
-## 1. 算子接口（v2 起唯一语义，无属性）
-
-```
+```text
 输入  x      : [B, H, L]  float32  ND 连续
       kernel : [H, K]     float32  ND 连续
 输出  y      : [B, H, L]  float32  ND 连续
 属性  无
 ```
 
-```
-y[b,h,t] = Σ_{j=0}^{K-1} x[b,h,t-j] · kernel[h,j]，  t-j < 0 时 x 视为 0
-```
-
-**这是数学卷积，不是 cross-correlation。** 若调用方的参考实现写成
-
-```python
-F.conv1d(F.pad(x, (K-1, 0)), kernel.unsqueeze(1), groups=H)
+```text
+y[b,h,t] = sum(j=0..K-1) x[b,h,t-j] * kernel[h,j]
+x[b,h,t-j] = 0, 当 t-j < 0
 ```
 
-那算的是 kernel 时域翻转后的结果，需要调用方自行 `kernel.flip(-1)` 后再调用本算子。
-v1 曾提供 `flip_kernel` 属性覆盖这两种语义，v2 按需求确认结果删除，接口只留输入输出。
+这是 causal depthwise 数学卷积，不是 `torch.nn.functional.conv1d` 默认执行的
+cross-correlation。设备接口只实现上述 math 语义。
 
-### 约束（host 校验，失败时打印具体原因）
+Host 校验：
 
-| 约束 | 值 |
-|---|---|
-| dtype | float32 |
-| 维度 | x `[B,H,L]`、kernel `[H,K]`，H 必须一致 |
-| 取值 | `B,H,L,K ≥ 1`，`K ≤ L` |
-| 长度 | `L + K - 1 ≤ 16384`（`FFT_CONV1D_MAX_NFFT`） |
-| 内存 | 连续（contiguous） |
+- `x` 为 3 维、`kernel` 为 2 维，且两个输入的 `H` 相同；
+- `B,H,L,K >= 1`；
+- `K <= L`；
+- 当前注册的数据类型为 `float32`。
 
----
+FFT 容量不是算子 shape 的硬上限；FFT 不适用时会回退 DIRECT。
 
-## 2. 两条路径
+## 2. 三路分派
 
-host tiling 静态分派，kernel 侧不做动态判断：
+定义：
 
-| 条件 | 路径 | 单元 |
+```text
+need = max(2, L + K - 1)
+N    = 不小于 need 的最小 4 的幂
+N1   = N2 = sqrt(N)
+```
+
+Host 静态分派：
+
+| 条件 | 路径 | 当前执行方式 |
 |---|---|---|
-| `K < 64` | 直接因果卷积 | 纯 Vector |
-| `K ≥ 64` | 四步 Cooley-Tukey FFT 卷积 | Cube GEMM + Vector |
+| `K < 64` | DIRECT | 主 AIV 上直接因果卷积 |
+| `K >= 64 && need <= 1024` | FFT-UB | 数据常驻 UB；当前 `FFT_CONV1D_USE_CUBE=0`，矩阵乘为 Vector Axpy 基线 |
+| `K >= 64 && 1024 < need <= 4096` | FFT-GM | `N=4096`；Cube 执行 GM Matmul，Vector 执行旋转因子与逐点运算 |
+| `need > 4096` | DIRECT 回退 | 保持数值覆盖，性能较慢 |
 
-分界点 64 目前是按阶段 2 的代价模型估的，**必须用 msprof 实测标定**（依赖 Cube/Vector 算力比 ρ，那个数只能实测）。
+`FFT_CONV1D_ENABLE_GM` 与 `FFT_CONV1D_ENABLE_GM_KERNEL` 必须同时启用或同时关闭。
 
-### FFT 分解的取舍
+## 3. Host tiling 与核切分
 
-`N` 取 **4 的幂**（`N = 4^⌈log4(L+K-1)⌉`），于是 `N1 = N2 = √N`：
+kernel 固定声明为 `KERNEL_TYPE_MIX_AIC_1_2`。一个逻辑组包含 1 个 AIC 和
+2 个 AIV，所以 Host 可用逻辑组数为：
 
-- `D1` 与 `D2` 是同一个矩阵（DFT 矩阵对称 + `N1 == N2`），常量表减半
-- **12 次 GEMM 形状统一为 `(N1, N1, N1)`**，只需一个 Matmul 对象、一套 `TCubeTiling`
+```text
+min(GetCoreNumAic(), GetCoreNumAiv() / 2)
+```
 
-代价：`N` 最多浪费 2 倍，MAC 数约为最优解的 1.5~4 倍（见 §5 待办）。
-换来的是 host/kernel 代码量和出错面大幅下降 —— 这是首个可上机版本的正确取舍。
-结构上仍是四步 Cooley-Tukey，后续放开是**优化而非重写**。
+- DIRECT 按 `B*H` 行切；
+- FFT-UB、FFT-GM 按通道 `H` 切，每个逻辑核处理所分通道的全部 batch；
+- `blockDim` 等于实际使用的逻辑组数。
 
----
+FFT-GM 的 Matmul tiling 与 kernel 类型一致：
 
-## 3. v2 优化项（每项都有依据与验证）
+```text
+A: GM / ND / float
+B: GM / ND / float
+C: GM / ND / float
+shape: (N1, N1, N1)
+```
 
-### [O1] 去掉逐行 `SyncAll`：每行 15 次 → 全 kernel 2 次
+FFT-GM 自有临时 UB 为：
 
-v1 在每个 Cube→Vector 边界都插了 `SyncAll()` 全局栅栏，因为当时无法上机确认
-`IterateAll` 之后 Cube 写 GM、Vector 再读 GM 的跨单元同步语义。
+```text
+6 * N * sizeof(float)
++ 2 * AlignUp8(N1) * sizeof(float)
++ 8192
+```
 
-依据（CANN 文档 `5.2.1.23 IterateAll`）：
+`N=4096, N1=64` 时共 `107008` 字节。Host 在 Matmul tiling 中只提供扣除
+这部分后的 UB 预算，避免 Matmul 与用户 `TPipe` 同时按整块 UB 规划。
+
+## 4. MIX 1:2 与 KFC 生命周期
+
+在 1:2 模式下，AIV 的 `GetBlockIdx()` 是展开后的索引。AIC、两个 AIV 使用同一
+逻辑核号：
 
 ```cpp
-template <bool sync = true> __aicore__ inline void IterateAll(
-    const GlobalTensor<DstT>& gm, uint8_t enAtomic = 0, ...)
+CoreIdx = (GetBlockIdx() - GetSubBlockIdx()) / GetTaskRation();
 ```
 
-> **同步：** 需要同步等待 IterateAll 执行结束
+每组只允许 `subBlockIdx == 0` 的主 AIV 执行用户 Vector/DMA 数据流。
 
-默认 `sync = true`，握手由 API 自己完成。加上阶段 2 每个核只访问自己的 scratch、
-无跨核依赖，逐行栅栏纯属浪费。v2 只保留 2 次 `SyncAll`：
+- DIRECT、非 Cube 的 FFT-UB：AIC 和第二个 AIV 直接退出；
+- FFT-GM：AIC 和两个 AIV 都必须先执行 `REGIST_MATMUL_OBJ`；
+- 第二个 AIV 注册后立即退出，其栈上 KFC client 析构并发送 `SERVICE_QUIT`；
+- 主 AIV 发起全部 Matmul，完成后析构并发送另一个 quit；
+- AIC 在 `REGIST_MATMUL_OBJ` 展开的 server 循环中服务消息，收到两个 quit 后返回。
 
-1. 常量表生成完毕（所有核都要读全部表）
-2. kernel 频谱生成完毕（核 A 写的 `Kf[h]` 会被核 B 读）
+第二个 AIV 不能在 `REGIST_MATMUL_OBJ` 之前退出，否则 CANN 8.5 的 KFC server
+会一直等待缺失的 client 生命周期。
 
-副产品：不再需要"所有核循环次数一致"的约束，两个循环都回归自然的
-`for (i = blockIdx; i < n; i += cores)` 跨步写法，空闲核不再空转。
+同步版 `IterateAll(GlobalTensor)` 完成 AIV→AIC→AIV 的消息握手和结果等待。
+FFT-GM 不再叠加外层 `SyncAll` 或手工 CrossCore flag，以免与 Matmul 内部 flag
+冲突，也不要求不同逻辑核执行相同次数的 Matmul。
 
-### [O2] 用 `IterateAll(enAtomic=1)` 累加，消除全部 Vector 合并 pass
+## 5. FFT-GM workspace 与数据流
 
-`enAtomic = 1` 是 AtomicAdd 累加（文档同章节参数表）。于是
+Host 总 workspace：
 
-```
-Cr = Br@Dr - Bi@Di   →   Gemm(Cr, Br, Dr, atomic=0); Gemm(Cr, Bi, Dn, atomic=1)
-y  = (Dr@Er + Di@Ei)/N →  Gemm(y, DrS, Er, atomic=0); Gemm(y, DiS, Ei, atomic=1)
-```
-
-新增 3 张常量表把减法和归一化都吃进去：
-
-| 表 | 定义 | 作用 |
-|---|---|---|
-| `Dn` | `-Di` | 让只会累加的 AtomicAdd 表达减法 |
-| `DrS` | `Dr / N` | 把 IRFFT 的 `1/N` 折进常量表 |
-| `DiS` | `Di / N` | 同上 |
-
-> 首次调用必须 `atomic=0`（覆盖写），否则会累加到上一行的残留值上。
-
-**等价性是逐位精确的**，不是近似：取负 `(-a)·b = -(a·b)` 精确；`N` 为 2 的幂
-所以 `Dr/N` 也精确。`test_atomic_refactor_is_bit_exact` 用 `rtol=0, atol=0` 守护，
-实测 v2 与 v1 差异 **0.0e+00**。
-
-收益：每行 Vector 全长 pass **8 → 3**（只剩 2 次旋转因子 + 1 次频域逐点乘），
-scratch 缓冲 **10 → 8**，少约 15N 字节 GM 往返。
-
-### [O3] 只清补零区
-
-`PrepareRow` 只清 `[count, N)`，不再整段清 `[0, N)`，省一遍 N 长度的 GM 写。
-
-### [O4] direct 路径：8 份移位副本，GM 读 `K` 次 → `min(8,K)` 次
-
-抽头 `j` 的源偏移是 `K-1-j`，逐 `j` 变化必然不满足 Vector 要求的 32B 对齐，
-v1 因此每个抽头都单独从 GM 读一整块（K 倍读放大）。
-
-关键观察：**偏移同余 8 的抽头之间相差 8 个 float = 32B，天然对齐**。
-所以只需预载 `min(8,K)` 份移位副本，副本 `r` 覆盖 `xz[t0+r ...]`，
-抽头 `j` 落在副本 `r = (K-1-j) % 8` 的第 `(K-1-j-r)` 个元素处，而该偏移恒为 8 的倍数。
-
-`K=63` 时 GM 读次数 63 → 8。`test_direct_shift_copy_is_exact` 逐位（`rtol=0, atol=0`）
-守护下标正确性，并用断言覆盖 32B 对齐与 workspace 越界。
-
-### [O5] ComplexMul 批量发搬运
-
-4 个 `DataCopyPad` 一起发再统一同步，而不是两两同步。
-
----
-
-## 4. workspace 布局
-
-FFT 路径（单位：float）：
-
-```
-[0]   Dr   : N        (N1*N1 == N)
-[N]   Di   : N
-[2N]  Dn   : N        = -Di
-[3N]  DrS  : N        = Dr / N
-[4N]  DiS  : N        = Di / N
-[5N]  Tr   : N
-[6N]  Ti   : N
-[7N]      Kfr : H*N
-[7N+HN]   Kfi : H*N
-[7N+2HN]  每核 scratch : usedCoreNum * 8 * N
-          （0:xmat 1:Br 2:Bi 3:Cr 4:Ci 5:Er 6:Ei 7:yout）
+```text
+[ Matmul/KFC 系统区 | 用户区 ]
 ```
 
-direct 路径：每核一份零前缀输入行 `AlignUp8(K-1+L)`。
+系统区大小由 `GetLibApiWorkSpaceSize()` 给出。FFT-GM 用户区大小为：
 
-**旋转因子生成**：必须"先做整数乘再取模"（`-2π·((k·n) mod M)/M`）。
-写成 `(-2π·k)·n/M` 这种浮点连乘会因为乘法不满足结合律，让本应对称的 DFT 矩阵
-出现 ~1e-14 不对称，破坏"D 对称所以不用转置"的前提。取模同时把角度压回 `(-2π, 0]`，
-避免大幅角三角函数的规约误差。这个坑是在 Python 原型阶段实测踩到并修掉的。
+```text
+usedCoreNum * 12 * N * sizeof(float)
+```
 
----
+kernel 入口的 `workspace` 指向整块空间首址。Matmul 使用
+`GetSysWorkSpacePtr()`，FFT-GM 必须且只调用一次
+`GetUserWorkspace(workspace)` 定位用户区；直接从 offset 0 写 scratch 会覆盖
+KFC 消息队列。
 
-## 5. 尚未做的优化（按性价比排序）
+每个逻辑核独占 12 个长度 `N` 的 float 槽：
 
-| # | 项 | 预期 | 说明 |
-|---|---|---|---|
-| 1 | 中间结果留 UB | ~10x | 现在算术强度约 3.4 MAC/byte，需 30+ 才算力受限。`N=4096` 时频谱两平面才 32KB，可全程驻 UB；Matmul 的 A 矩阵设 `TPosition::VECOUT` 直接喂 Cube |
-| 2 | 换回 2 的幂 + 非方形 `(N1,N2)` | 1.5–4.0x | 代价是 3 种 GEMM 形状、3 套 `TCubeTiling` |
-| 3 | 开启稀疏跳算 | 1.33x | `R1_in/R1_ker/R1_out`，需 `SetTail` 变形状 |
-| 4 | Hermitian 对称 | ~2x（中间三段） | 当前算全 N 点复数谱，未利用实信号共轭对称 |
-| 5 | double buffer | 2–3x | 现在 Load/Store 都是 SetFlag 后立即 WaitFlag，全串行 |
-| 6 | `GetSubBlockIdx` 拆分 Vector | ~2x（Vector 段） | 现在两个 AIV 做完全相同的工作 |
-| 7 | batch 配对打包 | ~2x（B 为偶数） | `x = a + i·b`，已在 `fft_conv1d_four_step_packed` 实现并测过 |
-| 8 | 复数 GEMM 改块矩阵 | GEMM 次数减半 | `[Ar|Ai] @ [[Br,Bi],[-Bi,Br]]`，需实虚部横向相邻的布局 |
-| 9 | 常量表跨 launch 缓存 | 固定开销 | 现在每次 launch 重算 `N1` 行 Cos/Sin/Fmod |
-| 10 | fp16 / bf16 + fp32 累加 | — | 旋转因子仍用 fp32 生成 |
-| 11 | 分界点标定 | — | `K < 64` 是估的，要用 msprof 实测 |
-| 12 | `R < 核数` 时按 k1 跨核 | — | 阶段 2 §3.2 已设计，默认关闭 |
+```text
+Dr, Di, Tr, Ti, Kr, Ki, Xr, Xi, Yr, Yi, Zr, Zi
+```
 
-**推进方式**：先用 msprof 看时间实际花在哪（别照这张表猜第 1、5 项谁占大头），
-再逐项做，每项单独提交并保留优化前后的性能与正确性数据。
+处理顺序：
 
----
+1. 主 AIV 在 UB 生成本核的 `D` 与 twiddle 表并写入本核 GM 槽；
+2. 按 `h = CoreIdx, CoreIdx + usedCoreNum, ...` 计算并缓存该通道的 kernel 频谱；
+3. 对该通道的每个 batch 执行输入 FFT、复数逐点乘、IFFT；
+4. IFFT 在最后一步乘 `1/N`；
+5. causal 输出直接裁剪线性卷积的 `[0:L]`。
 
-## 6. 验证
+Cube 的 A/B/C 都在 GM；Vector 运算前把所需平面搬到 UB，完成后写回 GM。
+`LoadG` 在覆盖复用 UB 前建立 `V_MTE2` 依赖，`StoreG` 建立
+`V_MTE3` 与 `MTE3_MTE2` 依赖。写给下一次 Matmul 的 GM 数据与 KFC 消息共用
+同一 MTE3 pipe，后发的 KFC 消息保证 AIC 不会早于前序 GM 写入读取输入。
 
-不需要 NPU 的逻辑守护（本机可跑）：
+## 6. 其他路径的 workspace
+
+- FFT-UB：无用户 workspace；
+- DIRECT：Host 当前申请
+  `2 * usedCoreNum * AlignUp8(K-1+L) * sizeof(float)`，kernel 每个主 AIV使用一行
+  零前缀缓冲。
+
+## 7. 验证
+
+本地静态与 CPU 回归：
 
 ```bash
-cd FFT_CONV1D && python3 -m pytest tests/ -q
+python3 -B -m pytest -q
+bash -n scripts/run_test.sh
+python3 -B -m py_compile scripts/gen_data.py scripts/fft_conv1d_dispatch.py
+git diff --check
 ```
 
-上机端到端：
+上机按路径运行：
 
 ```bash
-bash scripts/run_test.sh direct   # K<64
-bash scripts/run_test.sh fft      # K>=64
+bash scripts/run_test.sh direct
+bash scripts/run_test.sh fft
+bash scripts/run_test.sh fftgm
 ```
 
-判定标准：`assert_close(rtol=5e-3, atol=5e-3)` 必过，且相对最大误差 `< 1e-4`。
-未达标时 `compare_data.py` 会打印超标行数与最差位置来定位来源，**不放宽阈值**。
+CPU 数学测试和源码合同只能验证公式、分派及静态约束，不能证明以下目标行为：
 
----
+- CANN 8.5 Host/kernel clean build；
+- MIX 1:2 的实际 KFC 生命周期；
+- GM Matmul 与 MTE 可见性；
+- workspace ABI；
+- 910B 端到端精度、稳定性与性能。
 
-## 7. 本轮改动的未验证项
-
-以下是 v2 引入的新逻辑，Python 侧已逐位验证等价性，但**尚未在 910B 上跑过**，
-首次上机应优先确认：
-
-1. **`[O1]` 去掉逐行 `SyncAll` 后 FFT 路径是否仍数值正确。**
-   若 FFT 挂而 DIRECT 正常，说明 `IterateAll` 的默认同步没覆盖到我们的用法，
-   回退方式：在 `Gemm()` 之后、下一个 `ComplexMulInPlace()` 之前补 `SyncAll()`。
-2. **`[O2]` `enAtomic=1` 在 910B fp32 + GM 输出下的行为。**
-   若结果偏大且随机，检查是不是第一次 `Gemm` 的 `atomic` 参数被误设成了 1。
-3. **`[O4]` direct 路径的移位副本。**
-   下标逻辑已逐位验证，风险在 UB 容量：`8 × (tile+K) × 4B`，
-   `tile=1024, K=63` 约 35KB，若 `InitBuffer` 失败请调小 `FFT_CONV1D_DIRECT_TILE`。
+FFT-GM 合入前仍需在目标 CANN 8.5 环境 clean build，并在真实 910B 上至少覆盖
+`need=1025`、非 8 对齐 shape、`need=4096` 边界、多通道和多 batch。

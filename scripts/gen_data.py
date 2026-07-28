@@ -22,6 +22,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
 from fft_conv1d_reference import MODE_MATH, direct_conv1d_naive  # noqa: E402
+from fft_conv1d_dispatch import select_algorithm  # noqa: E402
 
 
 def main():
@@ -36,8 +37,6 @@ def main():
 
     if args.k > args.l:
         raise SystemExit(f"约束要求 K <= L，实际 K={args.k}, L={args.l}")
-    if args.l + args.k - 1 > 16384:
-        raise SystemExit(f"v1 约束要求 L+K-1 <= 16384，实际 {args.l + args.k - 1}")
 
     os.makedirs(args.out, exist_ok=True)
     g = torch.Generator().manual_seed(args.seed)
@@ -53,15 +52,7 @@ def main():
     with open(os.path.join(args.out, "meta.txt"), "w") as f:
         f.write(f"B={args.b}\nH={args.h}\nL={args.l}\nK={args.k}\nseed={args.seed}\n")
 
-    nfft = 4
-    while nfft < max(2, args.l + args.k - 1):
-        nfft *= 4
-    if args.k < 64 or nfft > 16384:
-        algo = "DIRECT"
-    elif nfft <= 1024:
-        algo = "FFT-UB"
-    else:
-        algo = "FFT-GM"
+    algo, nfft = select_algorithm(args.l, args.k)
     print(f"[gen_data] B={args.b} H={args.h} L={args.l} K={args.k}")
     print(f"[gen_data] 预期算法路径={algo}  N_fft={nfft}  N1=N2={int(nfft ** 0.5)}")
     print(f"[gen_data] 输出目录: {args.out}")

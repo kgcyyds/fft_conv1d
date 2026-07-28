@@ -8,9 +8,9 @@
 #
 # 用法：
 #   bash scripts/run_test.sh              # 跑全部用例
-#   bash scripts/run_test.sh direct       # 只跑 DIRECT 路径（K<64）
+#   bash scripts/run_test.sh direct       # 只跑 DIRECT 路径（小 K 或大 N 回退）
 #   bash scripts/run_test.sh fft          # 只跑 FFT-UB 路径（N<=1024）
-#   bash scripts/run_test.sh fftgm        # 只跑 FFT-GM 路径（N>1024）
+#   bash scripts/run_test.sh fftgm        # 只跑 FFT-GM 路径（N=4096）
 #   bash scripts/run_test.sh 2 16 257 17  # 跑单个用例 B H L K
 set -e
 
@@ -38,9 +38,9 @@ run_case() {
     echo ""
 }
 
-# K < 64 -> DIRECT 路径（含题目要求覆盖的全部 shape）
+# DIRECT 路径：K < 64，或 K >= 64 但 need=L+K-1 > 4096
 run_direct() {
-    echo "###### DIRECT 路径（K<64）######"
+    echo "###### DIRECT 路径（小 K 或大 N 回退）######"
     run_case 1 1 16 3
     run_case 2 3 31 7
     run_case 4 8 64 1
@@ -54,16 +54,17 @@ run_direct() {
     run_case 1 3 513 5
     run_case 1 1 1 1
     run_case 2 2 1024 63
+    # FFT-GM 当前只支持 need<=4096；该 shape 必须回退 DIRECT（N_fft=16384）
+    run_case 1 2 4096 1024
 }
 
-# K >= 64 -> FFT 路径
+# K >= 64 且 need <= 1024 -> FFT-UB 路径
 run_fft() {
-    echo "###### FFT 路径（K>=64）######"
+    echo "###### FFT-UB 路径（K>=64 且 need<=1024）######"
     run_case 1 1 64 64
     run_case 2 4 128 64
     run_case 2 2 256 128
     run_case 1 8 512 256
-    run_case 2 2 1024 1024
     run_case 1 1 100 100
     run_case 3 2 300 200
     run_case 1 5 255 255
@@ -73,15 +74,14 @@ run_fft() {
     run_case 3 7 256 100
 }
 
-# N > 1024 -> FFT-GM 路径（GM 缓冲 + 分块 Vector，解除 UB 容量限制）
+# 1024 < need <= 4096 -> FFT-GM 路径；四次幂规划下 N_fft 恒为 4096
 run_fft_gm() {
-    echo "###### FFT-GM 路径（N_fft > 1024）######"
+    echo "###### FFT-GM 路径（1024 < need<=4096，N_fft=4096）######"
     run_case 1 1 600 600      # N=4096
     run_case 2 2 1024 1024    # N=4096
     run_case 1 4 2048 512     # N=4096
-    run_case 2 2 2048 2048    # N=16384
-    run_case 1 2 4096 1024    # N=16384
-    run_case 3 3 1500 300     # N=4096, R 不整除
+    run_case 2 2 2048 2048    # N=4096（need=4095，上边界附近）
+    run_case 3 3 1500 300     # N=4096，L/K 均非 8 对齐
 }
 
 case "$1" in
@@ -93,7 +93,7 @@ case "$1" in
         if [ $# -eq 4 ]; then
             run_case "$1" "$2" "$3" "$4"
         else
-            echo "用法: bash scripts/run_test.sh [direct|fft| B H L K]"
+            echo "用法: bash scripts/run_test.sh [direct|fft|fftgm|B H L K]"
             exit 1
         fi
         ;;

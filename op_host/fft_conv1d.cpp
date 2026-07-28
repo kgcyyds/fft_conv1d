@@ -93,14 +93,14 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     const uint32_t nRadix = IsqrtPow4(nFft);
 
     // ---------------- 3. 算法分派 ----------------
-    // FFT 需同时满足：K 足够大（否则 direct 更快）且 N_fft 不超过 UB 容量上限。
+    // FFT 需同时满足：K 足够大（否则 direct 更快）且 N_fft 不超过对应路径上限。
     // 任一不满足就走 DIRECT —— DIRECT 对任意 shape 都数值正确，只是更慢，
     // 因此算子支持的 shape 范围不因这个上限而缩小。
     // 三路分派：
     //   K < 64                     -> DIRECT（小 K 时直接卷积更快）
     //   N <= 1024                  -> FFT（UB 常驻，已验证的基线）
-    //   1024 < N <= 16384          -> FFT_GM（UB 占用与 N 无关）
-    //   N > 16384                  -> DIRECT（兜底，数值仍然正确）
+    //   1024 < N <= 4096           -> FFT_GM（GM 后备存储，N=4096）
+    //   N > 4096                   -> DIRECT（兜底，数值仍然正确）
     uint32_t algo = FFT_CONV1D_ALGO_DIRECT;
     if (K >= FFT_CONV1D_FFT_MIN_K && need <= FFT_CONV1D_MAX_NFFT)
     {
@@ -110,11 +110,16 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
 
     // ---------------- 4. 多核切分 ----------------
     // FFT 按通道切（每核独占若干通道，kernel 频谱每通道只算一次）；
-    // DIRECT 按行切。两者都无跨核共享，不需要任何同步。
+    // DIRECT 按行切。blockDim 是 MIX 1:2 组合数；每组只由 sub-block 0
+    // 执行用户数据流，sub-block 1 仅完成 KFC 客户端生命周期。
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    uint32_t coreNum = ascendcPlatform.GetCoreNumAiv();
+    const uint32_t aicCoreNum = ascendcPlatform.GetCoreNumAic();
+    const uint32_t aivCoreNum = ascendcPlatform.GetCoreNumAiv();
+    const uint32_t aivGroupNum = aivCoreNum / 2;
+    uint32_t coreNum = (aicCoreNum < aivGroupNum) ? aicCoreNum : aivGroupNum;
     if (coreNum == 0)
     {
+        // 平台信息缺失时只保留单组合兜底。
         coreNum = 1;
     }
     const uint32_t totalRows = B * H;
@@ -142,10 +147,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     // 生成的成员布局由框架宏决定，不保证等于 sizeof(TCubeTiling)，
     // 手工 memset 可能越界写并导致 host 侧 segfault。
     //
-    // Cube 版矩阵乘需要 TCubeTiling。只在 FFT 路径求解：此时 N1 ∈ {16,32}，
+    // Cube 版矩阵乘需要 TCubeTiling。只在 FFT 路径求解：此时 N1 ∈ {16,32,64}，
     // 不会再出现当初 DIRECT 路径下 N1=8 小于 fp32 分形导致 GetTiling 返回 -1 的情况。
-    // kernel 侧 FFT_CONV1D_USE_CUBE=0 时这份 tiling 不被使用，求解失败也只是回退，
-    // 不让整个算子失败。
+    // FFT-GM 恒使用这份 tiling，因此求解失败必须直接返回错误。
     if (algo != FFT_CONV1D_ALGO_DIRECT)
     {
         // 操作数位置必须与 kernel 侧 MatmulType **逐个字段一致**，否则 Matmul 会按
@@ -168,7 +172,44 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         mmT.SetShape(s1, s1, s1);
         mmT.SetOrgShape(s1, s1, s1);
         mmT.SetBias(false);
-        mmT.SetBufferSpace(-1, -1, -1);
+        int32_t matmulUbBudget = -1;
+        if (gmPath)
+        {
+            // FFT-GM 自有 UB：
+            //   6 * N * fp32 + 2 * AlignUp8(N1) * fp32 + 8 KiB shared tmp。
+            // N=4096、N1=64 时为 107008B。SetBufferSpace 的第三个参数是
+            // Matmul 实际可用 UB，不能继续传 -1（表示整块 UB），否则 tiling 会
+            // 与 kernel 的 TPipe 缓冲重复规划同一片 UB。
+            constexpr uint64_t kGmFullBuffers = 6;
+            constexpr uint64_t kGmTmpBytes = 8 * 1024;
+            constexpr int32_t kCompatMatmulUbBudget = 48 * 1024;
+            const uint64_t alignedRadix = (static_cast<uint64_t>(nRadix) + 7U) & ~7ULL;
+            const uint64_t gmOwnedUb =
+                kGmFullBuffers * static_cast<uint64_t>(nFft) * sizeof(float) +
+                2U * alignedRadix * sizeof(float) + kGmTmpBytes;
+
+            uint64_t ubSize = 0;
+            ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
+            if (ubSize == 0)
+            {
+                // 部分旧版 platform stub 不返回 UB 大小；沿用已验证过的保守预算。
+                matmulUbBudget = kCompatMatmulUbBudget;
+            }
+            else if (ubSize <= gmOwnedUb)
+            {
+                printf("[fft_conv1d tiling] FFT-GM UB 不足: total=%llu owned=%llu\n",
+                       static_cast<unsigned long long>(ubSize),
+                       static_cast<unsigned long long>(gmOwnedUb));
+                return ge::GRAPH_FAILED;
+            }
+            else
+            {
+                const uint64_t availableUb = (ubSize - gmOwnedUb) & ~31ULL;
+                matmulUbBudget = static_cast<int32_t>(
+                    availableUb > 0x7fffffffULL ? 0x7fffffffULL : availableUb);
+            }
+        }
+        mmT.SetBufferSpace(-1, -1, matmulUbBudget);
         if (mmT.GetTiling(tilingData.cubeTiling) == -1)
         {
             // 不能只警告后继续：kernel 会拿着未初始化的 cubeTiling 去跑，
@@ -202,7 +243,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     context->GetRawTilingData()->SetDataSize(tilingData.GetDataSize());
 
     // ---------------- 8. workspace ----------------
-    // FFT 路径：全部数据常驻 UB，不需要用户 workspace
+    // FFT-UB 路径：全部数据常驻 UB，不需要用户 workspace
     // DIRECT 路径：每核一份零前缀输入行 (K-1+L)，按 8 对齐
     size_t userWorkspace = 0;
     if (algo == FFT_CONV1D_ALGO_FFT)

@@ -23,9 +23,8 @@
 // ---------------------------------------------------------------------------
 #define FFT_CONV1D_USE_CUBE 0
 
-// FFT-GM 尚未验证通过。置 0 时整段不参与编译，确保它不会影响
-// 已验证正确的 DIRECT / FFT-UB 两条路径。需与 host 的
-// FFT_CONV1D_ENABLE_GM 保持一致。
+// FFT-GM 修复仍需在目标 CANN/910B 上完成编译与精度验证。
+// 置 0 时整段不参与编译；必须与 host 的 FFT_CONV1D_ENABLE_GM 保持一致。
 #define FFT_CONV1D_ENABLE_GM_KERNEL 1
 
 #include "kernel_operator.h"
@@ -40,7 +39,7 @@ namespace
 {
 constexpr int32_t ALGO_DIRECT = 0;
 constexpr int32_t ALGO_FFT = 1;    // UB 常驻（N <= 1024）
-constexpr int32_t ALGO_FFT_GM = 2; // GM 版（N > 1024，解除限制）
+constexpr int32_t ALGO_FFT_GM = 2; // GM 版（当前仅 N=4096）
 constexpr int32_t GM_BUFS = 12;    // GM 版每核缓冲个数，与 host 一致
 
 constexpr int32_t VEC_CHUNK = 2048;  // Vector 逐点运算的分块长度（float 个数）
@@ -62,40 +61,30 @@ constexpr float TWO_PI = 6.283185307179586f;
 // 从而确认问题是否出在 Cube 写 GM 对 Vector 的可见性上。
 constexpr bool CONSERVATIVE_SYNC = false;
 
-// FFT-GM 的用户 workspace 基址。
-//   0 = workspace                   —— 与 DIRECT 路径一致，DIRECT 已验证可用
-//   1 = GetUserWorkspace(workspace) —— 文档说法，但从未单独验证过
-// 当前取 0：DIRECT 路径长期用裸 workspace 且结果正确，是更可靠的依据。
-// 若 GM 路径读回全 0，改成 1 再试一次即可 A/B。
-constexpr int32_t GM_USE_USER_WS = 0;
-
 __aicore__ inline void CubeVecSync()
 {
     if (CONSERVATIVE_SYNC)
     {
-        SyncAll();
+        SyncAll<false>();
     }
 }
 
 // ---------------------------------------------------------------------------
-// MIX 模式下取一致的 block 号
+// MIX 1:2 下把 AIC 与两个 AIV 映射到同一个逻辑 block 号
 // ---------------------------------------------------------------------------
-// 关键事实：KERNEL_TYPE_MIX_AIC_1_2 下同一份代码在 AIC 和 AIV 上都会执行，
-// 但两者的 GetBlockIdx() 取值范围不同：
-//   AIC: [0, blockDim)        AIV: [0, blockDim * 2)
-// （AscendC-S4 模板对 Vector 循环用 cnt = GetBlockNum()*GetTaskRation() 也印证了这点）
-//
-// 如果直接用 GetBlockIdx() 去切 scratch，Cube 会把 GEMM 结果写进 slot b，
-// 而与它配对的两个 AIV 会去读 slot 2b 和 2b+1 —— 其中一个永远读到从未被写过的
-// 区域（内容为 0），另一个还会越界写到 workspace 之外。
-// 这正是 “FFT 结果很多地方是 0” 的成因。
-//
-// GetTaskRation() 在 Cube 上返回 1、在 Vector 上返回 2，所以除一下就能得到
-// 两边一致的 block 号。代价是同一 block 的两个 AIV 做重复的 Vector 工作
-// （结果相同，无害），把 Vector 拆开是后续优化项。
+// CANN 8.5 的默认 Matmul 由 AIV 通过 KFC 消息驱动 AIC。每组只让 sub-block 0
+// 执行数据流；sub-block 1 仅完成 Matmul 客户端注册后退出，使服务端收到完整
+// 的 quit 消息。这样既保留 8.5 支持的 1:2 类型，也不会让两个 AIV 并发写同址。
 __aicore__ inline int32_t CoreIdx()
 {
-    return static_cast<int32_t>(GetBlockIdx() / GetTaskRation());
+    const int32_t blockIdx = static_cast<int32_t>(GetBlockIdx());
+    const int32_t subBlockIdx = static_cast<int32_t>(GetSubBlockIdx());
+    return (blockIdx - subBlockIdx) / static_cast<int32_t>(GetTaskRation());
+}
+
+__aicore__ inline bool IsPrimaryAiv()
+{
+    return GetSubBlockIdx() == 0;
 }
 
 __aicore__ inline int32_t AlignUp8(int32_t x)
@@ -153,8 +142,9 @@ class FftConv1dDirect
         Duplicate(zeros, 0.0f, AlignUp8(K_ > 8 ? K_ : 8));
         PipeBarrier<PIPE_V>();
 
-        const int32_t base = static_cast<int32_t>(GetBlockIdx()) * rowLen_;
-        for (int32_t row = static_cast<int32_t>(GetBlockIdx()); row < rows_; row += cores_)
+        const int32_t coreIdx = CoreIdx();
+        const int32_t base = coreIdx * rowLen_;
+        for (int32_t row = coreIdx; row < rows_; row += cores_)
         {
             // input 布局 [B,H,L]，行号 row = b*H + h => 通道号 h = row % H
             LoadKernelRow(row % H_);
@@ -578,32 +568,21 @@ class FftConv1dFft
 
 #if FFT_CONV1D_ENABLE_GM_KERNEL
 // ============================================================================
-// 路径三：FFT-GM（重新设计版）—— 以“消灭同步问题”为唯一目标，暂不考虑性能
+// 路径三：FFT-GM
 // ============================================================================
-// 设计出发点是一条已验证的事实：UB 路径（FftConv1dFft）完全正确，它的 Matmul
-// 用的是 IterateAll(LocalTensor) **同步**重载，Cube 的输入输出都在 UB，
-// 因此不存在 “Cube 写 GM、Vector 读 GM” 的跨核可见性问题。
+// - 每个逻辑核独占 12 个长度 N 的 GM 缓冲。
+// - Vector 在 UB 中生成表和做逐点运算，Cube 通过 GM/GM/GM Matmul 做 DFT。
+// - MIX 1:2 使用 CANN 8.5 支持的默认 KFC 消息驱动；每组只有 sub-block 0
+//   发起 Matmul，sub-block 1 注册后立即退出。
+// - 同步版 IterateAll(GlobalTensor) 完成 AIV -> AIC -> AIV 握手并保证 GM
+//   结果可见，不再叠加全核 SyncAll。
+// - kernel 入口收到的是整块 workspace。Matmul 通过 GetSysWorkSpacePtr()
+//   使用前部系统区，FFT-GM 必须通过 GetUserWorkspace() 跳到用户区。
 //
-// 所以本设计的铁律：**Cube 永远不碰 GM**。
-//   - GM 只作为 12 个长度 N 的后备存储（每核独占一片）
-//   - 每个运算之前把整块 N 个 float 从 GM 搬进 UB，算完再整块搬回
-//   - 矩阵乘一律走 A/B/C 全在 UB 的同步重载（与已验证的 UB 路径完全一致）
-//
-// 由此消除的失败面：
-//   1. Cube→GM→Vector 的跨核同步          => 不存在，Cube 只读写 UB
-//   2. IterateAll 的异步/waitIterateAll   => 用的是没有该参数的同步重载
-//   3. Matmul 系统 workspace 与用户数据重叠 => 用户区从 GetUserWorkspace() 起算
-//   4. SyncAll 调用次数不匹配              => 全程没有 SyncAll（每核零共享）
-//   5. Vector 非对齐访问                   => 所有搬运都是整块 N，UB 侧偏移恒为 0
-//
-// 代价：UB 需同时容纳 6 个长度 N 的缓冲（复数逐点乘要 4 入 2 出），
-//       N=4096 时 6*16KB=96KB，是本路径的上限；N>4096 由 host 回退 DIRECT。
-//       相对 UB 路径的 1024，覆盖范围提升 4 倍（L+K-1 <= 4096）。
+// N=4096 时 Vector 临时 UB 为 6*16KB 加索引/角度/tmp，共 107008B。
 class FftConv1dFftGm
 {
   public:
-    // A/B/C 全在 GM —— 与 AscendC-S4 模板中已验证可用的配置一致。
-    // Cube 直接读写 GM，不经 UB 中转。
     Matmul<MatmulType<TPosition::GM, CubeFormat::ND, float>,
            MatmulType<TPosition::GM, CubeFormat::ND, float>,
            MatmulType<TPosition::GM, CubeFormat::ND, float>,
@@ -629,52 +608,49 @@ class FftConv1dFftGm
         xGm_.SetGlobalBuffer((__gm__ float *)x);
         wGm_.SetGlobalBuffer((__gm__ float *)w);
         yGm_.SetGlobalBuffer((__gm__ float *)y);
-        // 用户区必须避开系统 workspace：Matmul 的内部 scratch 用的就是系统区
-        wsGm_.SetGlobalBuffer((__gm__ float *)(GM_USE_USER_WS ? GetUserWorkspace(workspace)
-                                                             : workspace));
+        // Host 申请的是 [系统 workspace | 用户 workspace]。入口参数仍指向
+        // 整块空间首址；KFC/Matmul 使用系统区，FFT-GM scratch 必须从用户区
+        // 开始，避免覆盖 KFC 消息队列。
+        const uint64_t workspaceElements =
+            static_cast<uint64_t>(cores_) * GM_BUFS * static_cast<uint64_t>(N_);
+        // MatmulClient::SetTensorA/B 会把 GlobalTensor::GetSize() 写进 KFC
+        // 消息；设备侧的无长度 SetGlobalBuffer 不初始化该字段。
+        wsGm_.SetGlobalBuffer((__gm__ float *)GetUserWorkspace(workspace), workspaceElements);
 
         base_ = static_cast<uint64_t>(CoreIdx()) * GM_BUFS * N_;
 
-        const int32_t nb = N_ * sizeof(float);
-        pipe->InitBuffer(b0_, nb);
-        pipe->InitBuffer(b1_, nb);
-        pipe->InitBuffer(b2_, nb);
-        pipe->InitBuffer(b3_, nb);
-        pipe->InitBuffer(b4_, nb);
-        pipe->InitBuffer(b5_, nb);
-        pipe->InitBuffer(bIdx_, AlignUp8(N1_) * sizeof(float));
-        pipe->InitBuffer(bAng_, AlignUp8(N1_) * sizeof(float));
-        pipe->InitBuffer(bTmp_, TMP_BUF_BYTES);
+        if ASCEND_IS_AIV
+        {
+            const int32_t nb = N_ * sizeof(float);
+            pipe->InitBuffer(b0_, nb);
+            pipe->InitBuffer(b1_, nb);
+            pipe->InitBuffer(b2_, nb);
+            pipe->InitBuffer(b3_, nb);
+            pipe->InitBuffer(b4_, nb);
+            pipe->InitBuffer(b5_, nb);
+            pipe->InitBuffer(bIdx_, AlignUp8(N1_) * sizeof(float));
+            pipe->InitBuffer(bAng_, AlignUp8(N1_) * sizeof(float));
+            pipe->InitBuffer(bTmp_, TMP_BUF_BYTES);
+        }
     }
 
     __aicore__ inline void Process()
     {
         BuildTables();
-        SyncAll();
-
-        // SyncAll 是全核栅栏，要求**所有核调用次数一致**，
-        // 所以两层循环都用固定次数 + active 标志（分不到通道的核照样走完流程，
-        // 只是不写回输出）。这也是 AscendC-S4 模板的做法。
-        const int32_t chPerCore = (H_ + cores_ - 1) / cores_;
-        for (int32_t i = 0; i < chPerCore; ++i)
+        for (int32_t h = CoreIdx(); h < H_; h += cores_)
         {
-            const int32_t h = CoreIdx() + i * cores_;
-            const bool active = (h < H_);
-            LoadRowG(Buf(XR), wGm_, static_cast<uint64_t>(active ? h : 0) * K_, K_);
+            LoadRowG(Buf(XR), wGm_, static_cast<uint64_t>(h) * K_, K_);
             Forward();
             CopyG(Buf(KR), Buf(XR));
             CopyG(Buf(KI), Buf(XI));
             for (int32_t b = 0; b < B_; ++b)
             {
-                const int32_t row = active ? (b * H_ + h) : 0;
+                const int32_t row = b * H_ + h;
                 LoadRowG(Buf(XR), xGm_, static_cast<uint64_t>(row) * L_, L_);
                 Forward();
                 CMulG(Buf(XR), Buf(XI), Buf(KR), Buf(KI), false);
                 Inverse();
-                if (active)
-                {
-                    StoreOutG(static_cast<uint64_t>(row) * L_);
-                }
+                StoreOutG(static_cast<uint64_t>(row) * L_);
             }
         }
     }
@@ -690,6 +666,8 @@ class FftConv1dFftGm
     // ---------------- GM <-> UB 的整块搬运（长度恒为 N，UB 偏移恒为 0）----------------
     __aicore__ inline void LoadG(const LocalTensor<float> &d, uint64_t off)
     {
+        SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
+        WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
         DataCopyExtParams cp{1, static_cast<uint32_t>(N_) * 4U, 0, 0, 0};
         DataCopyPadExtParams<float> pad{false, 0, 0, 0};
         DataCopyPad(d, wsGm_[off], cp, pad);
@@ -705,10 +683,17 @@ class FftConv1dFftGm
         DataCopyPad(wsGm_[off], s, cp);
         SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
         WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+        // CopyG 会立刻用 MTE2 覆盖同一个 UB，必须等前一次 MTE3 读完。
+        SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
     }
 
     __aicore__ inline void CopyG(uint64_t dst, uint64_t src)
     {
+        if ASCEND_IS_AIC
+        {
+            return;
+        }
         LocalTensor<float> t = b0_.Get<float>();
         LoadG(t, src);
         StoreG(dst, t);
@@ -719,6 +704,10 @@ class FftConv1dFftGm
     // 保证 D[k][n] == D[n][k] 精确成立（“D 对称所以不用转置”是本方案的前提）。
     __aicore__ inline void BuildTables()
     {
+        if ASCEND_IS_AIC
+        {
+            return;
+        }
         LocalTensor<float> idx = bIdx_.Get<float>();
         LocalTensor<float> ang = bAng_.Get<float>();
         LocalTensor<uint8_t> tmp = bTmp_.Get<uint8_t>();
@@ -753,33 +742,25 @@ class FftConv1dFftGm
         PipeBarrier<PIPE_V>();
     }
 
-    // ---------------- 矩阵乘：GM -> UB -> Cube -> UB -> GM ----------------
-    // Cube 的输入输出全在 UB，走的是没有 waitIterateAll 参数的同步重载，
-    // 与已验证的 UB 路径完全一致，因此不存在跨核可见性问题。
-    // 矩阵乘：A/B/C 全在 GM，Cube 直接读写。
-    //
+    // ---------------- 矩阵乘：A/B/C 全在 GM ----------------
     __aicore__ inline void MatMulG(uint64_t c, uint64_t a, uint64_t b)
     {
-        // 同步只能用 SyncAll()。
-        // 官方文档说明：Matmul 高阶 API **内部已经使用 CrossCoreSetFlag/WaitFlag**
-        // 做核间同步，不建议再手工调用该接口 —— 手工插入会与它的内部握手
-        // 争用同一组 flag 计数器，导致死锁（上一版正是这么挂的）。
-        // PipeBarrier 也不行：只约束单核内流水，跨不到 AIC/AIV。
-        //
-        // 代价：SyncAll 是全核栅栏，要求所有核调用次数一致，
-        // 因此 Process() 的循环必须是固定次数 + active 标志。
-        SyncAll();
+        // 默认 KFC Matmul 的同步 IterateAll 已完成 AIV->AIC 与 AIC->AIV
+        // 握手。外层不再叠加 SyncAll/CrossCore flag。
         mm_.SetTensorA(wsGm_[a]);
         mm_.SetTensorB(wsGm_[b]);
         mm_.IterateAll(wsGm_[c]);
         mm_.End();
-        SyncAll();
     }
 
     // ---------------- 逐点运算：整块进出 ----------------
     // kind: 0 = a+b, 1 = a-b, 2 = (a+b)*s
     __aicore__ inline void BinG(uint64_t dst, uint64_t oa, uint64_t ob, int32_t kind, float s)
     {
+        if ASCEND_IS_AIC
+        {
+            return;
+        }
         LocalTensor<float> a = b0_.Get<float>();
         LocalTensor<float> b = b1_.Get<float>();
         LocalTensor<float> c = b2_.Get<float>();
@@ -806,6 +787,10 @@ class FftConv1dFftGm
     __aicore__ inline void CMulG(uint64_t oar, uint64_t oai, uint64_t obr, uint64_t obi,
                                  bool conjB)
     {
+        if ASCEND_IS_AIC
+        {
+            return;
+        }
         LocalTensor<float> ar = b0_.Get<float>();
         LocalTensor<float> ai = b1_.Get<float>();
         LocalTensor<float> br = b2_.Get<float>();
@@ -878,6 +863,10 @@ class FftConv1dFftGm
     __aicore__ inline void LoadRowG(uint64_t dst, const GlobalTensor<float> &src, uint64_t off,
                                     int32_t count)
     {
+        if ASCEND_IS_AIC
+        {
+            return;
+        }
         LocalTensor<float> a = b0_.Get<float>();
         Duplicate(a, 0.0f, N_);
         PipeBarrier<PIPE_V>();
@@ -894,6 +883,10 @@ class FftConv1dFftGm
     // 因果卷积取线性卷积前 L 点，偏移为 0
     __aicore__ inline void StoreOutG(uint64_t yOff)
     {
+        if ASCEND_IS_AIC
+        {
+            return;
+        }
         LocalTensor<float> a = b0_.Get<float>();
         LoadG(a, Buf(XR));
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
@@ -920,12 +913,20 @@ extern "C" __global__ __aicore__ void fft_conv1d(GM_ADDR x, GM_ADDR kernel, GM_A
                                                  GM_ADDR workspace, GM_ADDR tiling)
 {
     GET_TILING_DATA(tilingData, tiling);
-    // GM 版 FFT 恒用 Cube，因此任务类型必须是 MIX（DIRECT/UB 版在 MIX 下同样能跑）
+    // CANN 8.5 支持 MIX 1:2；每组只让 sub-block 0 执行用户 Vector 数据流。
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
 
     TPipe pipe;
     if (tilingData.algo == ALGO_DIRECT)
     {
+        if ASCEND_IS_AIC
+        {
+            return;
+        }
+        if (!IsPrimaryAiv())
+        {
+            return;
+        }
         FftConv1dDirect op;
         op.Init(&pipe, x, kernel, y, workspace, tilingData);
         op.Process();
@@ -933,9 +934,18 @@ extern "C" __global__ __aicore__ void fft_conv1d(GM_ADDR x, GM_ADDR kernel, GM_A
 #if FFT_CONV1D_ENABLE_GM_KERNEL
     else if (tilingData.algo == ALGO_FFT_GM)
     {
-        // GM 版：UB 占用与 N 无关，支持大 N（解除 L+K-1 <= 1024）
+        // GM 版：中间结果落 GM，当前 UB 预算支持 N=4096
         FftConv1dFftGm op;
         REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), op.mm_, &tilingData.cubeTiling);
+        // 默认 KFC server 等待两个 AIV client 的 quit。第二个 AIV 必须先完成
+        // REGIST_MATMUL_OBJ，再退出；不能在注册前直接 return。
+        if ASCEND_IS_AIV
+        {
+            if (!IsPrimaryAiv())
+            {
+                return;
+            }
+        }
         op.Init(&pipe, x, kernel, y, workspace, tilingData);
         op.Process();
     }
@@ -946,6 +956,22 @@ extern "C" __global__ __aicore__ void fft_conv1d(GM_ADDR x, GM_ADDR kernel, GM_A
         FftConv1dFft op;
 #if FFT_CONV1D_USE_CUBE
         REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), op.mm_, &tilingData.cubeTiling);
+        if ASCEND_IS_AIV
+        {
+            if (!IsPrimaryAiv())
+            {
+                return;
+            }
+        }
+#else
+        if ASCEND_IS_AIC
+        {
+            return;
+        }
+        if (!IsPrimaryAiv())
+        {
+            return;
+        }
 #endif
         op.Init(&pipe, x, kernel, y, workspace, tilingData);
         op.Process();
