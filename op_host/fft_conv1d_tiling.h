@@ -30,7 +30,10 @@ constexpr uint32_t FFT_CONV1D_FORCE_SINGLE_CORE = 0;
 // N=1024 时 48KB（很宽裕），N=4096 时 192KB（放不下）。故上限取 1024。
 // 超出时 host 自动回退 DIRECT —— DIRECT 对任意 K 数值都正确，功能覆盖不减。
 constexpr uint32_t FFT_CONV1D_MAX_NFFT_UB = 1024;  // UB 常驻上限 => N1 = 32（48KB）
-constexpr uint32_t FFT_CONV1D_MAX_NFFT = 16384;    // GM 版上限 => N1 = 128
+// GM 版上限：重设计后 Cube 永不碰 GM，运算整块经 UB 中转，
+// 复数逐点乘需同时驻留 6 个长度 N 的 UB 缓冲 => N=4096 时 6*16KB=96KB 为上限。
+// 超出由 host 回退 DIRECT（数值仍正确）。
+constexpr uint32_t FFT_CONV1D_MAX_NFFT = 4096;     // GM 版上限 => N1 = 64
 constexpr uint32_t FFT_CONV1D_GM_BUFS = 12;        // GM 版每核缓冲个数，与 kernel 一致
 constexpr uint32_t FFT_CONV1D_FFT_MIN_K = 64;    // K 小于该值走 direct（见设计文档 §9）
 constexpr uint32_t FFT_CONV1D_DIRECT_TILE = 4096; // direct 路径的输出分块长度

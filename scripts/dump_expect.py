@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from fft_conv1d_four_step import FourStepTables, plan_v1  # noqa: E402
 
 STAGE_NAME = {
+    0: "Dr  常量表实部（GM_DUMP_BUF=0）",
     1: "Dr  常量表实部",
     2: "Tr  旋转因子实部",
     3: "scr0 补零后的输入行",
@@ -31,7 +32,7 @@ STAGE_NAME = {
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", type=int, required=True, choices=[1, 2, 3, 4, 5, 6])
+    ap.add_argument("--stage", type=int, required=True, choices=[0, 1, 2, 3, 4, 5, 6])
     ap.add_argument("--dir", type=str, default="data")
     ap.add_argument("--n", type=int, default=16, help="打印前几个元素")
     args = ap.parse_args()
@@ -53,7 +54,9 @@ def main():
     N, N1 = plan.N, plan.N1
     tb = FourStepTables.build(plan)
 
-    if args.stage == 1:
+    if args.stage == 0:   # GM_DUMP_BUF=0 -> Dr
+        exp = tb.D1r.reshape(-1)[:L]
+    elif args.stage == 1:
         exp = tb.D1r.reshape(-1)[:L]
     elif args.stage == 2:
         exp = tb.Tr.reshape(-1)[:L]
