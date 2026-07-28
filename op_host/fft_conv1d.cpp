@@ -166,7 +166,12 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         mmT.SetShape(s1, s1, s1);
         mmT.SetOrgShape(s1, s1, s1);
         mmT.SetBias(false);
-        mmT.SetBufferSpace(-1, -1, -1);
+        // 不能用 -1（"用满可用空间"）：kernel 侧已经先占了大量 UB
+        //   UB 路径 N<=1024 -> 12*N*4 = 48KB
+        //   GM 路径 N<=4096 -> 6*N*4 + 8KB tmp ≈ 105KB
+        // 按满 UB 规划 tiling 会与实际可用空间不符。留给 Matmul 一个保守额度。
+        constexpr int32_t kMatmulUbBudget = 48 * 1024;
+        mmT.SetBufferSpace(-1, -1, kMatmulUbBudget);
         if (mmT.GetTiling(tilingData.cubeTiling) == -1)
         {
             printf("[fft_conv1d tiling] 警告: N1=%u 的 Cube tiling 求解失败"

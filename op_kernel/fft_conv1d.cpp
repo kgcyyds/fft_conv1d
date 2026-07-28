@@ -746,10 +746,16 @@ class FftConv1dFftGm
         LocalTensor<float> uc = b2_.Get<float>();
         LoadG(ua, a);
         LoadG(ub, b);
+        // GM 路径独有的同步问题：A/B 是被 **MTE2**（DataCopyPad GM->UB）写进 UB 的，
+        // 而 UB 路径里它们是被 Vector 写的。Matmul API 管的是 V->Cube 这条链，
+        // MTE2->Cube 没人保证，必须自己插全流水栅栏。
+        PipeBarrier<PIPE_ALL>();
         mm_.SetTensorA(ua);
         mm_.SetTensorB(ub);
-        mm_.IterateAll(uc); // UB -> UB，同步
+        mm_.IterateAll(uc); // UB -> UB，同步重载
         mm_.End();
+        // 同理，输出侧的消费者是 **MTE3**（DataCopyPad UB->GM）而不是 Vector，
+        // Cube->MTE3 也需要显式栅栏。
         PipeBarrier<PIPE_ALL>();
         StoreG(c, uc);
     }
