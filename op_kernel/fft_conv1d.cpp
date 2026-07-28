@@ -23,6 +23,11 @@
 // ---------------------------------------------------------------------------
 #define FFT_CONV1D_USE_CUBE 0
 
+// FFT-GM 尚未验证通过。置 0 时整段不参与编译，确保它不会影响
+// 已验证正确的 DIRECT / FFT-UB 两条路径。需与 host 的
+// FFT_CONV1D_ENABLE_GM 保持一致。
+#define FFT_CONV1D_ENABLE_GM_KERNEL 0
+
 #include "kernel_operator.h"
 
 // 必须无条件包含：自动生成的 TilingData 里含 TCubeTiling 字段，
@@ -576,6 +581,7 @@ class FftConv1dFft
     int32_t B_, H_, L_, K_, N_, N1_, cores_;
 };
 
+#if FFT_CONV1D_ENABLE_GM_KERNEL
 // ============================================================================
 // 路径三：FFT-GM（重新设计版）—— 以“消灭同步问题”为唯一目标，暂不考虑性能
 // ============================================================================
@@ -908,6 +914,8 @@ class FftConv1dFftGm
     int32_t B_, H_, L_, K_, N_, N1_, cores_;
 };
 
+#endif // FFT_CONV1D_ENABLE_GM_KERNEL
+
 // ============================================================================
 // kernel 入口
 // ============================================================================
@@ -925,6 +933,7 @@ extern "C" __global__ __aicore__ void fft_conv1d(GM_ADDR x, GM_ADDR kernel, GM_A
         op.Init(&pipe, x, kernel, y, workspace, tilingData);
         op.Process();
     }
+#if FFT_CONV1D_ENABLE_GM_KERNEL
     else if (tilingData.algo == ALGO_FFT_GM)
     {
         // GM 版：UB 占用与 N 无关，支持大 N（解除 L+K-1 <= 1024）
@@ -933,6 +942,7 @@ extern "C" __global__ __aicore__ void fft_conv1d(GM_ADDR x, GM_ADDR kernel, GM_A
         op.Init(&pipe, x, kernel, y, workspace, tilingData);
         op.Process();
     }
+#endif
     else
     {
         // UB 常驻版：已验证正确的基线，小 N 走这里
