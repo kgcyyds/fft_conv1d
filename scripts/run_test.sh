@@ -9,7 +9,8 @@
 # 用法：
 #   bash scripts/run_test.sh              # 跑全部用例
 #   bash scripts/run_test.sh direct       # 只跑 DIRECT 路径（K<64）
-#   bash scripts/run_test.sh fft          # 只跑 FFT 路径（K>=64）
+#   bash scripts/run_test.sh fft          # 只跑 FFT-UB 路径（N<=1024）
+#   bash scripts/run_test.sh fftgm        # 只跑 FFT-GM 路径（N>1024）
 #   bash scripts/run_test.sh 2 16 257 17  # 跑单个用例 B H L K
 set -e
 
@@ -72,10 +73,22 @@ run_fft() {
     run_case 3 7 256 100
 }
 
+# N > 1024 -> FFT-GM 路径（GM 缓冲 + 分块 Vector，解除 UB 容量限制）
+run_fft_gm() {
+    echo "###### FFT-GM 路径（N_fft > 1024）######"
+    run_case 1 1 600 600      # N=4096
+    run_case 2 2 1024 1024    # N=4096
+    run_case 1 4 2048 512     # N=4096
+    run_case 2 2 2048 2048    # N=16384
+    run_case 1 2 4096 1024    # N=16384
+    run_case 3 3 1500 300     # N=4096, R 不整除
+}
+
 case "$1" in
     direct) run_direct ;;
     fft)    run_fft ;;
-    "")     run_direct; run_fft ;;
+    fftgm)  run_fft_gm ;;
+    "")     run_direct; run_fft; run_fft_gm ;;
     *)
         if [ $# -eq 4 ]; then
             run_case "$1" "$2" "$3" "$4"

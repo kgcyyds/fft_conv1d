@@ -56,7 +56,12 @@ def main():
     nfft = 4
     while nfft < max(2, args.l + args.k - 1):
         nfft *= 4
-    algo = "DIRECT" if args.k < 64 else "FFT"
+    if args.k < 64 or nfft > 16384:
+        algo = "DIRECT"
+    elif nfft <= 1024:
+        algo = "FFT-UB"
+    else:
+        algo = "FFT-GM"
     print(f"[gen_data] B={args.b} H={args.h} L={args.l} K={args.k}")
     print(f"[gen_data] 预期算法路径={algo}  N_fft={nfft}  N1=N2={int(nfft ** 0.5)}")
     print(f"[gen_data] 输出目录: {args.out}")

@@ -96,8 +96,17 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     // FFT 需同时满足：K 足够大（否则 direct 更快）且 N_fft 不超过 UB 容量上限。
     // 任一不满足就走 DIRECT —— DIRECT 对任意 shape 都数值正确，只是更慢，
     // 因此算子支持的 shape 范围不因这个上限而缩小。
-    const bool useFft = (K >= FFT_CONV1D_FFT_MIN_K) && (need <= FFT_CONV1D_MAX_NFFT);
-    const uint32_t algo = useFft ? FFT_CONV1D_ALGO_FFT : FFT_CONV1D_ALGO_DIRECT;
+    // 三路分派：
+    //   K < 64                     -> DIRECT（小 K 时直接卷积更快）
+    //   N <= 1024                  -> FFT（UB 常驻，已验证的基线）
+    //   1024 < N <= 16384          -> FFT_GM（UB 占用与 N 无关）
+    //   N > 16384                  -> DIRECT（兜底，数值仍然正确）
+    uint32_t algo = FFT_CONV1D_ALGO_DIRECT;
+    if (K >= FFT_CONV1D_FFT_MIN_K && need <= FFT_CONV1D_MAX_NFFT)
+    {
+        algo = (need <= FFT_CONV1D_MAX_NFFT_UB) ? FFT_CONV1D_ALGO_FFT
+                                                : FFT_CONV1D_ALGO_FFT_GM;
+    }
 
     // ---------------- 4. 多核切分 ----------------
     // FFT 按通道切（每核独占若干通道，kernel 频谱每通道只算一次）；
@@ -109,7 +118,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         coreNum = 1;
     }
     const uint32_t totalRows = B * H;
-    const uint32_t splitUnit = (algo == FFT_CONV1D_ALGO_FFT) ? H : totalRows;
+    const uint32_t splitUnit = (algo != FFT_CONV1D_ALGO_DIRECT) ? H : totalRows;
     uint32_t usedCoreNum = (splitUnit < coreNum) ? splitUnit : coreNum;
     if (usedCoreNum == 0)
     {
@@ -129,20 +138,27 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     }
 
     FftConv1dTilingData tilingData;
-    memset(&tilingData.cubeTiling, 0, sizeof(TCubeTiling));
+    // 注意：不要对 tilingData.cubeTiling 做 memset。TILING_DATA_FIELD_DEF_STRUCT
+    // 生成的成员布局由框架宏决定，不保证等于 sizeof(TCubeTiling)，
+    // 手工 memset 可能越界写并导致 host 侧 segfault。
+    //
     // Cube 版矩阵乘需要 TCubeTiling。只在 FFT 路径求解：此时 N1 ∈ {16,32}，
     // 不会再出现当初 DIRECT 路径下 N1=8 小于 fp32 分形导致 GetTiling 返回 -1 的情况。
     // kernel 侧 FFT_CONV1D_USE_CUBE=0 时这份 tiling 不被使用，求解失败也只是回退，
     // 不让整个算子失败。
-    if (algo == FFT_CONV1D_ALGO_FFT)
+    if (algo != FFT_CONV1D_ALGO_DIRECT)
     {
+        // 操作数位置必须与 kernel 侧 MatmulType 一致：
+        //   UB 版 -> A/B 在 VECOUT、C 在 VECIN；GM 版 -> 全在 GM
+        const bool gmPath = (algo == FFT_CONV1D_ALGO_FFT_GM);
+        const auto posAB = gmPath ? matmul_tiling::TPosition::GM
+                                  : matmul_tiling::TPosition::VECOUT;
+        const auto posC = gmPath ? matmul_tiling::TPosition::GM
+                                 : matmul_tiling::TPosition::VECIN;
         matmul_tiling::MatmulApiTiling mmT(ascendcPlatform);
-        mmT.SetAType(matmul_tiling::TPosition::VECOUT, matmul_tiling::CubeFormat::ND,
-                     matmul_tiling::DataType::DT_FLOAT);
-        mmT.SetBType(matmul_tiling::TPosition::VECOUT, matmul_tiling::CubeFormat::ND,
-                     matmul_tiling::DataType::DT_FLOAT);
-        mmT.SetCType(matmul_tiling::TPosition::VECIN, matmul_tiling::CubeFormat::ND,
-                     matmul_tiling::DataType::DT_FLOAT);
+        mmT.SetAType(posAB, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+        mmT.SetBType(posAB, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+        mmT.SetCType(posC, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
         mmT.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
                         matmul_tiling::DataType::DT_FLOAT);
         const int32_t s1 = static_cast<int32_t>(nRadix);
@@ -158,7 +174,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     }
 
     printf("[fft_conv1d tiling] B=%u H=%u L=%u K=%u | algo=%s N=%u N1=%u cores=%u tileLen=%u\n",
-           B, H, L, K, (algo == FFT_CONV1D_ALGO_FFT) ? "FFT" : "DIRECT",
+           B, H, L, K, (algo == FFT_CONV1D_ALGO_FFT) ? "FFT-UB" : ((algo == FFT_CONV1D_ALGO_FFT_GM) ? "FFT-GM" : "DIRECT"),
            nFft, nRadix, usedCoreNum, tileLen);
 
     // ---------------- 7. 填 TilingData ----------------
@@ -186,7 +202,13 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     size_t userWorkspace = 0;
     if (algo == FFT_CONV1D_ALGO_FFT)
     {
-        userWorkspace = 0; // 全部数据常驻 UB
+        userWorkspace = 0; // UB 常驻，不需要用户 workspace
+    }
+    else if (algo == FFT_CONV1D_ALGO_FFT_GM)
+    {
+        // 每核 12 个长度 N 的缓冲：Dr Di Tr Ti Kfr Kfi Xr Xi Yr Yi Zr Zi
+        userWorkspace = static_cast<size_t>(usedCoreNum) * FFT_CONV1D_GM_BUFS *
+                        static_cast<size_t>(nFft) * sizeof(float);
     }
     else
     {

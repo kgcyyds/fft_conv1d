@@ -14,7 +14,8 @@ namespace optiling
 
 // 算法分支：host 侧根据 K 与 L 静态选择，kernel 侧不做动态判断
 constexpr uint32_t FFT_CONV1D_ALGO_DIRECT = 0; // 直接因果卷积（Vector）
-constexpr uint32_t FFT_CONV1D_ALGO_FFT = 1;    // 四步 Cooley-Tukey（Cube + Vector）
+constexpr uint32_t FFT_CONV1D_ALGO_FFT = 1;     // UB 常驻（N <= FFT_CONV1D_MAX_NFFT_UB）
+constexpr uint32_t FFT_CONV1D_ALGO_FFT_GM = 2;  // GM 版（更大的 N）
 
 // 调试开关：强制单核（blockDim = 1）。
 // 单核可一次性排除多核相关的全部复杂度：scratch 分片、跨核共享、栅栏计数匹配。
@@ -28,7 +29,9 @@ constexpr uint32_t FFT_CONV1D_FORCE_SINGLE_CORE = 1;
 // FFT 路径 N_fft 上限。重写版把中间结果全部放 UB：12 个长度 N 的缓冲，
 // N=1024 时 48KB（很宽裕），N=4096 时 192KB（放不下）。故上限取 1024。
 // 超出时 host 自动回退 DIRECT —— DIRECT 对任意 K 数值都正确，功能覆盖不减。
-constexpr uint32_t FFT_CONV1D_MAX_NFFT = 1024;   // => N1 = N2 = 32
+constexpr uint32_t FFT_CONV1D_MAX_NFFT_UB = 1024;  // UB 常驻上限 => N1 = 32（48KB）
+constexpr uint32_t FFT_CONV1D_MAX_NFFT = 16384;    // GM 版上限 => N1 = 128
+constexpr uint32_t FFT_CONV1D_GM_BUFS = 12;        // GM 版每核缓冲个数，与 kernel 一致
 constexpr uint32_t FFT_CONV1D_FFT_MIN_K = 64;    // K 小于该值走 direct（见设计文档 §9）
 constexpr uint32_t FFT_CONV1D_DIRECT_TILE = 4096; // direct 路径的输出分块长度
 
