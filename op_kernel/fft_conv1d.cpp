@@ -57,25 +57,12 @@ constexpr float TWO_PI = 6.283185307179586f;
 // 从而确认问题是否出在 Cube 写 GM 对 Vector 的可见性上。
 constexpr bool CONSERVATIVE_SYNC = false;
 
-// ---------------------------------------------------------------------------
-// 调试开关：把中间结果直接写进输出张量，用现有测试链路读回来定位
-// ---------------------------------------------------------------------------
-// 不引入任何新 API（只用已经在用的 DataCopyPad），npu_out.bin 里读到的就是选中的
-// 那一级中间结果。用 scripts/dump_expect.py 生成对应的期望值比对。
-//   0 = 正常输出
-//   1 = Dr   常量表实部（第 0 行应全为 1.0，因为 k=0 时 cos(0)=1）
-//   2 = Tr   旋转因子实部（同上，第 0 行全 1.0）
-//   3 = scr0 补零后的输入行（前 L 个应等于输入本身）  <-- 先测这个
-//   4 = scr1 步骤 A 的 Br = Dr @ xmat
-//   5 = scr5 正变换输出实部
-//   6 = Kfr  kernel 频谱实部
-constexpr int32_t DEBUG_DUMP_STAGE = 0;
-
-// FFT-GM 路径专用 dump：把指定的 GM 缓冲直接写进输出张量，用现有测试链路读回。
-//  -1 = 正常输出
-//   0=Dr  1=Di  2=Tr  3=Ti  4=Kfr 5=Kfi  6=Xr  7=Xi  8=Yr  9=Yi  10=Zr 11=Zi
-// 建议顺序：0（常量表，最好认：k=0 行全 1.0）-> 6（补零输入）-> 8（第一次 GEMM 的 Br）
-constexpr int32_t GM_DUMP_BUF = -1;
+// FFT-GM 的用户 workspace 基址：这是目前唯一还没被单独验证过的假设。
+//   1 = GetUserWorkspace(workspace)  —— 文档说 workspace 前半段是系统区，
+//       Matmul 的内部 scratch 用它，用户数据应从这之后开始
+//   0 = workspace                    —— DIRECT 路径就是这么用的，且已验证可写
+// 两者必有一个对。改这一行重编即可 A/B。
+constexpr int32_t GM_USE_USER_WS = 1;
 
 __aicore__ inline void CubeVecSync()
 {
@@ -636,7 +623,8 @@ class FftConv1dFftGm
         wGm_.SetGlobalBuffer((__gm__ float *)w);
         yGm_.SetGlobalBuffer((__gm__ float *)y);
         // 用户区必须避开系统 workspace：Matmul 的内部 scratch 用的就是系统区
-        wsGm_.SetGlobalBuffer((__gm__ float *)GetUserWorkspace(workspace));
+        wsGm_.SetGlobalBuffer((__gm__ float *)(GM_USE_USER_WS ? GetUserWorkspace(workspace)
+                                                             : workspace));
 
         base_ = static_cast<uint64_t>(CoreIdx()) * GM_BUFS * N_;
 
@@ -885,7 +873,7 @@ class FftConv1dFftGm
     __aicore__ inline void StoreOutG(uint64_t yOff)
     {
         LocalTensor<float> a = b0_.Get<float>();
-        LoadG(a, (GM_DUMP_BUF < 0) ? Buf(XR) : Buf(GM_DUMP_BUF));
+        LoadG(a, Buf(XR));
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
         DataCopyExtParams cp{1, static_cast<uint32_t>(L_) * 4U, 0, 0, 0};
