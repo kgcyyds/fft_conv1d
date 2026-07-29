@@ -33,7 +33,7 @@ constexpr uint32_t FFT_CONV1D_MAX_NFFT_UB = 1024;   // => N1 = 32
 //           a) N1 = sqrt(N) 要能被 Matmul tiling 接受（N=16384 -> N1=128，可行）
 //           b) Row() 逐行生成时 N1 <= VEC_CHUNK（128 << 2048，宽裕）
 //           c) workspace = 12 * N * 核数 * 4B（N=16384、20 核约 15.7MB）
-constexpr uint32_t FFT_CONV1D_MAX_NFFT_GM = 16384;  // => N1 = 128
+// constexpr uint32_t FFT_CONV1D_MAX_NFFT_GM = 16384;  // => N1 = 128
 //
 // 超过 FFT_CONV1D_MAX_NFFT_GM 的 shape 回退 DIRECT：数值仍然正确，只是更慢，
 // 因此算子支持的 shape 范围不受这些容量上限影响。
