@@ -652,6 +652,12 @@ class FftConv1dFftGm
 
     __aicore__ inline void CopyG(uint64_t dst, uint64_t src)
     {
+        // 纯 Vector 工作，AIC 必须跳过：否则 Half() 会用 AIC 语境的
+        // subIdx_ 算出错误区间，导致 AIC 也往 GM 写错误的半区。
+        if ASCEND_IS_AIC
+        {
+            return;
+        }
         LocalTensor<float> t = b0_.Get<float>();
         int32_t beg = 0;
         int32_t fin = 0;
@@ -754,6 +760,11 @@ class FftConv1dFftGm
     // kind: 0 = a+b, 1 = a-b, 2 = (a+b)*s
     __aicore__ inline void BinG(uint64_t dst, uint64_t oa, uint64_t ob, int32_t kind, float s)
     {
+        // 纯 Vector 工作，AIC 必须跳过（理由同 CopyG）
+        if ASCEND_IS_AIC
+        {
+            return;
+        }
         LocalTensor<float> a = b0_.Get<float>();
         LocalTensor<float> b = b1_.Get<float>();
         LocalTensor<float> c = b2_.Get<float>();
