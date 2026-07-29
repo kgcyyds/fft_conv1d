@@ -29,7 +29,7 @@ namespace
 constexpr int32_t ALGO_DIRECT = 0;
 constexpr int32_t ALGO_FFT = 1;    // UB 常驻（N <= 1024）
 constexpr int32_t ALGO_FFT_GM = 2; // GM 版（当前仅 N=4096）
-constexpr int32_t GM_BUFS = 12;    // GM 版每核缓冲个数，与 host 一致
+constexpr int32_t FFT_GM_BUFFER_COUNT = 12; // GM 版每个 AIV worker 的缓冲个数
 
 constexpr int32_t VEC_CHUNK = 2048;  // Vector 逐点运算的分块长度（float 个数）
 constexpr int32_t TMP_BUF_BYTES = 8192; // Cos/Sin/Fmod 需要的 sharedTmpBuffer
@@ -37,21 +37,14 @@ constexpr float TWO_PI = 6.283185307179586f;
 
 
 // ---------------------------------------------------------------------------
-// MIX 1:2 下把 AIC 与两个 AIV 映射到同一个逻辑 block 号
+// MIX 1:2 下的 Vector worker 编号
 // ---------------------------------------------------------------------------
-// CANN 8.5 的默认 Matmul 由 AIV 通过 KFC 消息驱动 AIC。每组只让 sub-block 0
-// 执行数据流；sub-block 1 仅完成 Matmul 客户端注册后退出，使服务端收到完整
-// 的 quit 消息。这样既保留 8.5 支持的 1:2 类型，也不会让两个 AIV 并发写同址。
-__aicore__ inline int32_t CoreIdx()
+// CANN 8.5 在 AIV 侧返回展开后的 GetBlockIdx()：
+//   group 0 -> worker 0/1，group 1 -> worker 2/3，...
+// 因此直接使用它作为 AIV worker 编号，两个 Vector 核可各自处理不同的行/通道。
+__aicore__ inline int32_t VectorWorkerIdx()
 {
-    const int32_t blockIdx = static_cast<int32_t>(GetBlockIdx());
-    const int32_t subBlockIdx = static_cast<int32_t>(GetSubBlockIdx());
-    return (blockIdx - subBlockIdx) / static_cast<int32_t>(GetTaskRation());
-}
-
-__aicore__ inline bool IsPrimaryAiv()
-{
-    return GetSubBlockIdx() == 0;
+    return static_cast<int32_t>(GetBlockIdx());
 }
 
 __aicore__ inline int32_t AlignUp8(int32_t x)
@@ -89,7 +82,7 @@ class FftConv1dDirect
         rows_ = t.totalRows;
         // flip_ = t.flipKernel;
         tile_ = t.tileLen;
-        cores_ = t.usedCoreNum;
+        workers_ = static_cast<int32_t>(t.usedCoreNum) * 2;
         rowLen_ = AlignUp8(K_ - 1 + L_);
 
         xGm_.SetGlobalBuffer((__gm__ float *)x);
@@ -109,9 +102,9 @@ class FftConv1dDirect
         Duplicate(zeros, 0.0f, AlignUp8(K_ > 8 ? K_ : 8));
         PipeBarrier<PIPE_V>();
 
-        const int32_t coreIdx = CoreIdx();
-        const int32_t base = coreIdx * rowLen_;
-        for (int32_t row = coreIdx; row < rows_; row += cores_)
+        const int32_t workerIdx = VectorWorkerIdx();
+        const int32_t base = workerIdx * rowLen_;
+        for (int32_t row = workerIdx; row < rows_; row += workers_)
         {
             // input 布局 [B,H,L]，行号 row = b*H + h => 通道号 h = row % H
             LoadKernelRow(row % H_);
@@ -195,7 +188,7 @@ class FftConv1dDirect
 
     GlobalTensor<float> xGm_, wGm_, yGm_, wsGm_;
     TBuf<TPosition::VECCALC> bufIn_, bufOut_, bufK_, bufZero_;
-    int32_t H_, L_, K_, rows_, tile_, cores_, rowLen_;
+    int32_t H_, L_, K_, rows_, tile_, workers_, rowLen_;
 };
 
 // ============================================================================
@@ -245,7 +238,7 @@ class FftConv1dFft
         K_ = t.kernelLen;
         N_ = t.nFft;
         N1_ = t.nRadix;
-        cores_ = t.usedCoreNum;
+        workers_ = static_cast<int32_t>(t.usedCoreNum) * 2;
 
         xGm_.SetGlobalBuffer((__gm__ float *)x);
         wGm_.SetGlobalBuffer((__gm__ float *)w);
@@ -273,7 +266,7 @@ class FftConv1dFft
 
         // 按通道切核：每个核完整拥有若干通道，核之间零共享，因此不需要任何同步。
         // kernel 频谱在通道循环体内只算一次，被该通道的全部 batch 复用。
-        for (int32_t h = CoreIdx(); h < H_; h += cores_)
+        for (int32_t h = VectorWorkerIdx(); h < H_; h += workers_)
         {
             LoadToX(wGm_, static_cast<uint64_t>(h) * K_, K_); // Xr = [kernel 行, 0...]
             Forward();                                        // -> (Xr, Xi)
@@ -509,16 +502,16 @@ class FftConv1dFft
     GlobalTensor<float> xGm_, wGm_, yGm_;
     TBuf<TPosition::VECCALC> bDr_, bDi_, bTr_, bTi_, bKr_, bKi_;
     TBuf<TPosition::VECCALC> bXr_, bXi_, bYr_, bYi_, bZr_, bZi_, bTmp_;
-    int32_t B_, H_, L_, K_, N_, N1_, cores_;
+    int32_t B_, H_, L_, K_, N_, N1_, workers_;
 };
 
 // ============================================================================
 // 路径三：FFT-GM
 // ============================================================================
-// - 每个逻辑核独占 12 个长度 N 的 GM 缓冲。
+// - 每个 AIV worker 独占 12 个长度 N 的 GM 缓冲。
 // - Vector 在 UB 中生成表和做逐点运算，Cube 通过 GM/GM/GM Matmul 做 DFT。
-// - MIX 1:2 使用 CANN 8.5 支持的默认 KFC 消息驱动；每组只有 sub-block 0
-//   发起 Matmul，sub-block 1 注册后立即退出。
+// - MIX 1:2 使用 CANN 8.5 支持的默认 KFC 消息驱动；两个 AIV 都作为独立
+//   worker 发起 Matmul，同组 AIC server 依次服务两个 client 队列。
 // - 同步版 IterateAll(GlobalTensor) 完成 AIV -> AIC -> AIV 握手并保证 GM
 //   结果可见，不再叠加全核 SyncAll。
 // - kernel 入口收到的是整块 workspace。Matmul 通过 GetSysWorkSpacePtr()
@@ -548,11 +541,8 @@ class FftConv1dFftGm
         K_ = t.kernelLen;
         N_ = t.nFft;
         N1_ = t.nRadix;
-        cores_ = t.usedCoreNum;
-        // 两个 AIV 各处理一半：sub-block 0 取前半，sub-block 1 取后半。
-        // 两半不相交，且它们与 Cube 的汇合由 MatMulG 里已有的 SyncAll 完成，
-        // 不需要引入任何新的同步原语。
-        subIdx_ = static_cast<int32_t>(GetSubBlockIdx());
+        workers_ = static_cast<int32_t>(t.usedCoreNum) * 2;
+        workerIdx_ = VectorWorkerIdx();
 
         xGm_.SetGlobalBuffer((__gm__ float *)x);
         wGm_.SetGlobalBuffer((__gm__ float *)w);
@@ -561,12 +551,13 @@ class FftConv1dFftGm
         // 整块空间首址；KFC/Matmul 使用系统区，FFT-GM scratch 必须从用户区
         // 开始，避免覆盖 KFC 消息队列。
         const uint64_t workspaceElements =
-            static_cast<uint64_t>(cores_) * GM_BUFS * static_cast<uint64_t>(N_);
+            static_cast<uint64_t>(workers_) * FFT_GM_BUFFER_COUNT *
+            static_cast<uint64_t>(N_);
         // MatmulClient::SetTensorA/B 会把 GlobalTensor::GetSize() 写进 KFC
         // 消息；设备侧的无长度 SetGlobalBuffer 不初始化该字段。
         wsGm_.SetGlobalBuffer((__gm__ float *)GetUserWorkspace(workspace), workspaceElements);
 
-        base_ = static_cast<uint64_t>(CoreIdx()) * GM_BUFS * N_;
+        base_ = static_cast<uint64_t>(workerIdx_) * FFT_GM_BUFFER_COUNT * N_;
 
         if ASCEND_IS_AIV
         {
@@ -591,7 +582,7 @@ class FftConv1dFftGm
     __aicore__ inline void Process()
     {
         BuildTables();
-        for (int32_t h = CoreIdx(); h < H_; h += cores_)
+        for (int32_t h = workerIdx_; h < H_; h += workers_)
         {
             LoadRowG(Buf(XR), wGm_, static_cast<uint64_t>(h) * K_, K_);
             Forward();
@@ -611,14 +602,6 @@ class FftConv1dFftGm
 
   private:
     enum : int32_t { DR = 0, DI, TR, TI, KR, KI, XR, XI, YR, YI, ZR, ZI };
-
-    // 本 AIV 负责的区间 [begin, end)。切分点按 8 对齐 => 两半首地址都 32B 对齐。
-    __aicore__ inline void Half(int32_t total, int32_t &begin, int32_t &end) const
-    {
-        const int32_t mid = MinU(AlignUp8((total + 1) / 2), total);
-        begin = (subIdx_ == 0) ? 0 : mid;
-        end = (subIdx_ == 0) ? mid : total;
-    }
 
     __aicore__ inline uint64_t Buf(int32_t i) const
     {
@@ -652,19 +635,15 @@ class FftConv1dFftGm
 
     __aicore__ inline void CopyG(uint64_t dst, uint64_t src)
     {
-        // 纯 Vector 工作，AIC 必须跳过：否则 Half() 会用 AIC 语境的
-        // subIdx_ 算出错误区间，导致 AIC 也往 GM 写错误的半区。
+        // 纯 Vector 工作，AIC 必须跳过。
         if ASCEND_IS_AIC
         {
             return;
         }
         LocalTensor<float> t = b0_.Get<float>();
-        int32_t beg = 0;
-        int32_t fin = 0;
-        Half(N_, beg, fin);
-        for (int32_t o = beg; o < fin; o += VEC_CHUNK)
+        for (int32_t o = 0; o < N_; o += VEC_CHUNK)
         {
-            const int32_t len = MinU(VEC_CHUNK, fin - o);
+            const int32_t len = MinU(VEC_CHUNK, N_ - o);
             LoadG(t, src + o, len);
             StoreG(dst + o, t, len);
         }
@@ -690,10 +669,7 @@ class FftConv1dFftGm
 
         CreateVecIndex(idx, 0.0f, N1_);
         PipeBarrier<PIPE_V>();
-        int32_t kBeg = 0;
-        int32_t kEnd = 0;
-        Half(N1_, kBeg, kEnd);
-        for (int32_t k = kBeg; k < kEnd; ++k)
+        for (int32_t k = 0; k < N1_; ++k)
         {
             const uint64_t off = static_cast<uint64_t>(k) * N1_;
             Row(re, im, idx, ang, tmp, k, N1_);
@@ -760,7 +736,7 @@ class FftConv1dFftGm
     // kind: 0 = a+b, 1 = a-b, 2 = (a+b)*s
     __aicore__ inline void BinG(uint64_t dst, uint64_t oa, uint64_t ob, int32_t kind, float s)
     {
-        // 纯 Vector 工作，AIC 必须跳过（理由同 CopyG）
+        // 纯 Vector 工作，AIC 必须跳过（理由同 CopyG）。
         if ASCEND_IS_AIC
         {
             return;
@@ -768,12 +744,9 @@ class FftConv1dFftGm
         LocalTensor<float> a = b0_.Get<float>();
         LocalTensor<float> b = b1_.Get<float>();
         LocalTensor<float> c = b2_.Get<float>();
-        int32_t beg = 0;
-        int32_t fin = 0;
-        Half(N_, beg, fin);
-        for (int32_t o = beg; o < fin; o += VEC_CHUNK)
+        for (int32_t o = 0; o < N_; o += VEC_CHUNK)
         {
-            const int32_t len = MinU(VEC_CHUNK, fin - o);
+            const int32_t len = MinU(VEC_CHUNK, N_ - o);
             LoadG(a, oa + o, len);
             LoadG(b, ob + o, len);
             if (kind == 1)
@@ -808,12 +781,9 @@ class FftConv1dFftGm
         LocalTensor<float> bi = b3_.Get<float>();
         LocalTensor<float> t0 = b4_.Get<float>();
         LocalTensor<float> t1 = b5_.Get<float>();
-        int32_t beg = 0;
-        int32_t fin = 0;
-        Half(N_, beg, fin);
-        for (int32_t o = beg; o < fin; o += VEC_CHUNK)
+        for (int32_t o = 0; o < N_; o += VEC_CHUNK)
         {
-            const int32_t len = MinU(VEC_CHUNK, fin - o);
+            const int32_t len = MinU(VEC_CHUNK, N_ - o);
             LoadG(ar, oar + o, len);
             LoadG(ai, oai + o, len);
             LoadG(br, obr + o, len);
@@ -887,12 +857,9 @@ class FftConv1dFftGm
             return;
         }
         LocalTensor<float> a = b0_.Get<float>();
-        int32_t beg = 0;
-        int32_t fin = 0;
-        Half(N_, beg, fin);
-        for (int32_t o = beg; o < fin; o += VEC_CHUNK)
+        for (int32_t o = 0; o < N_; o += VEC_CHUNK)
         {
-            const int32_t len = MinU(VEC_CHUNK, fin - o);
+            const int32_t len = MinU(VEC_CHUNK, N_ - o);
             Duplicate(a, 0.0f, len);
             PipeBarrier<PIPE_V>();
             const int32_t valid = (o < count) ? MinU(len, count - o) : 0;
@@ -919,12 +886,9 @@ class FftConv1dFftGm
             return;
         }
         LocalTensor<float> a = b0_.Get<float>();
-        int32_t beg = 0;
-        int32_t fin = 0;
-        Half(L_, beg, fin);
-        for (int32_t o = beg; o < fin; o += VEC_CHUNK)
+        for (int32_t o = 0; o < L_; o += VEC_CHUNK)
         {
-            const int32_t len = MinU(VEC_CHUNK, fin - o);
+            const int32_t len = MinU(VEC_CHUNK, L_ - o);
             LoadG(a, Buf(XR) + o, len);
             SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
             WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
@@ -939,8 +903,7 @@ class FftConv1dFftGm
     TBuf<TPosition::VECCALC> b0_, b1_, b2_, b3_, b4_, b5_;
     TBuf<TPosition::VECCALC> bIdx_, bAng_, bQ_, bQi_, bTmp_;
     uint64_t base_;
-    int32_t B_, H_, L_, K_, N_, N1_, cores_;
-    int32_t subIdx_;
+    int32_t B_, H_, L_, K_, N_, N1_, workers_, workerIdx_;
 };
 
 
@@ -951,17 +914,13 @@ extern "C" __global__ __aicore__ void fft_conv1d(GM_ADDR x, GM_ADDR kernel, GM_A
                                                  GM_ADDR workspace, GM_ADDR tiling)
 {
     GET_TILING_DATA(tilingData, tiling);
-    // CANN 8.5 支持 MIX 1:2；每组只让 sub-block 0 执行用户 Vector 数据流。
+    // CANN 8.5 支持 MIX 1:2；两个 AIV 都作为独立 Vector worker。
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
 
     TPipe pipe;
     if (tilingData.algo == ALGO_DIRECT)
     {
         if ASCEND_IS_AIC
-        {
-            return;
-        }
-        if (!IsPrimaryAiv())
         {
             return;
         }
@@ -974,14 +933,12 @@ extern "C" __global__ __aicore__ void fft_conv1d(GM_ADDR x, GM_ADDR kernel, GM_A
         // GM 版：中间结果落 GM，当前 UB 预算支持 N=4096
         FftConv1dFftGm op;
         REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), op.mm_, &tilingData.cubeTiling);
-        // 默认 KFC server 等待两个 AIV client 的 quit。第二个 AIV 必须先完成
-        // REGIST_MATMUL_OBJ，再退出；不能在注册前直接 return。
+        // 两个 AIV client 都执行，各自处理不同通道并使用独立 scratch。
         if ASCEND_IS_AIV
         {
-            // 两个 AIV 都参与：数据被切成不相交的两半
+            op.Init(&pipe, x, kernel, y, workspace, tilingData);
+            op.Process();
         }
-        op.Init(&pipe, x, kernel, y, workspace, tilingData);
-        op.Process();
     }
     else
     {
@@ -990,13 +947,8 @@ extern "C" __global__ __aicore__ void fft_conv1d(GM_ADDR x, GM_ADDR kernel, GM_A
         REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), op.mm_, &tilingData.cubeTiling);
         if ASCEND_IS_AIV
         {
-            // 每组只让 sub-block 0 跑数据流；sub-block 1 完成 KFC 客户端注册后退出
-            if (!IsPrimaryAiv())
-            {
-                return;
-            }
+            op.Init(&pipe, x, kernel, y, workspace, tilingData);
+            op.Process();
         }
-        op.Init(&pipe, x, kernel, y, workspace, tilingData);
-        op.Process();
     }
 }

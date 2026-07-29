@@ -113,9 +113,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     }
 
     // ---------------- 4. 多核切分 ----------------
-    // FFT 按通道切（每核独占若干通道，kernel 频谱每通道只算一次）；
-    // DIRECT 按行切。blockDim 是 MIX 1:2 组合数；每组只由 sub-block 0
-    // 执行用户数据流，sub-block 1 仅完成 KFC 客户端生命周期。
+    // FFT 按通道切（每个 AIV worker 独占若干通道，kernel 频谱每通道只算一次）；
+    // DIRECT 按行切。blockDim 是 MIX 1:2 组合数，每组提供两个 AIV worker。
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
     const uint32_t aicCoreNum = ascendcPlatform.GetCoreNumAic();
     const uint32_t aivCoreNum = ascendcPlatform.GetCoreNumAiv();
@@ -128,12 +127,15 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     }
     const uint32_t totalRows = B * H;
     const uint32_t splitUnit = (algo != FFT_CONV1D_ALGO_DIRECT) ? H : totalRows;
-    uint32_t usedCoreNum = (splitUnit < coreNum) ? splitUnit : coreNum;
+    // 两个 AIV 都执行，因此只需启动 ceil(splitUnit / 2) 个 MIX 组。
+    const uint32_t neededGroupNum = CeilDiv(splitUnit, 2);
+    uint32_t usedCoreNum = (neededGroupNum < coreNum) ? neededGroupNum : coreNum;
     if (usedCoreNum == 0)
     {
         usedCoreNum = 1;
     }
-    const uint32_t rowsPerCore = CeilDiv(totalRows, usedCoreNum);
+    const uint32_t vectorWorkerNum = usedCoreNum * 2;
+    const uint32_t rowsPerCore = CeilDiv(totalRows, vectorWorkerNum);
 
     // direct 路径的输出分块长度
     uint32_t tileLen = (L < FFT_CONV1D_DIRECT_TILE) ? L : FFT_CONV1D_DIRECT_TILE;
@@ -182,9 +184,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         }
     }
 
-    printf("[fft_conv1d tiling] B=%u H=%u L=%u K=%u | algo=%s N=%u N1=%u cores=%u tileLen=%u\n",
+    printf("[fft_conv1d tiling] B=%u H=%u L=%u K=%u | algo=%s N=%u N1=%u groups=%u aivWorkers=%u tileLen=%u\n",
            B, H, L, K, (algo == FFT_CONV1D_ALGO_FFT) ? "FFT-UB" : ((algo == FFT_CONV1D_ALGO_FFT_GM) ? "FFT-GM" : "DIRECT"),
-           nFft, nRadix, usedCoreNum, tileLen);
+           nFft, nRadix, usedCoreNum, vectorWorkerNum, tileLen);
 
     // ---------------- 7. 填 TilingData ----------------
     tilingData.set_batch(B);
@@ -207,7 +209,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
 
     // ---------------- 8. workspace ----------------
     // FFT-UB 路径：全部数据常驻 UB，不需要用户 workspace
-    // DIRECT 路径：每核一份零前缀输入行 (K-1+L)，按 8 对齐
+    // DIRECT 路径：每个 AIV worker 一份零前缀输入行 (K-1+L)，按 8 对齐
     size_t userWorkspace = 0;
     if (algo == FFT_CONV1D_ALGO_FFT)
     {
@@ -215,15 +217,16 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     }
     else if (algo == FFT_CONV1D_ALGO_FFT_GM)
     {
-        // 每核 12 个长度 N 的缓冲：Dr Di Tr Ti Kfr Kfi Xr Xi Yr Yi Zr Zi
-        userWorkspace = static_cast<size_t>(usedCoreNum) * FFT_CONV1D_GM_BUFS *
+        // 每个 AIV worker 12 个长度 N 的独立缓冲，避免两个 KFC client 并发写同址。
+        userWorkspace = static_cast<size_t>(vectorWorkerNum) *
+                        FFT_CONV1D_GM_BUFFER_COUNT *
                         static_cast<size_t>(nFft) * sizeof(float);
     }
     else
     {
-        // 每核一份，2 倍余量（AIV_ONLY 下 blockDim 即核数，2x 纯属保险）
+        // 每个 AIV worker 一份零前缀行缓冲。
         const size_t rowLen = ((static_cast<size_t>(K) - 1 + L + 7) / 8) * 8;
-        userWorkspace = 2 * static_cast<size_t>(usedCoreNum) * rowLen * sizeof(float);
+        userWorkspace = static_cast<size_t>(vectorWorkerNum) * rowLen * sizeof(float);
     }
     const size_t sysWorkspace = static_cast<size_t>(ascendcPlatform.GetLibApiWorkSpaceSize());
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);

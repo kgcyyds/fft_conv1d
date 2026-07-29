@@ -10,8 +10,8 @@
 当前 FFT-GM 与本文目标方案的主要差异：
 
 - 使用 `KERNEL_TYPE_MIX_AIC_1_2` 和 CANN 8.5 默认 KFC 消息驱动；
-- 每组只有主 AIV 执行用户数据流，第二个 AIV 注册 Matmul client 后退出；
-- 每逻辑核独占 12 个长度 `N` 的 GM 槽，Cube 的 A/B/C 均在 GM；
+- 每组的两个 AIV 都是独立 worker，按通道交错分工并分别驱动同组 AIC server；
+- 每个 AIV worker 独占 12 个长度 `N` 的 GM 槽，Cube 的 A/B/C 均在 GM；
 - 系统 workspace 供 Matmul/KFC 使用，scratch 通过
   `GetUserWorkspace(workspace)` 定位到用户区；
 - FFT 按通道 `H` 切核，DIRECT 才按 `B*H` 行切核。

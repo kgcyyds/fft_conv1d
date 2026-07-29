@@ -72,7 +72,7 @@ def _without_cpp_comments(source):
 def _fft_gm_source():
     source = _source("op_kernel/fft_conv1d.cpp")
     start = source.index("class FftConv1dFftGm")
-    end = source.index("#endif // FFT_CONV1D_ENABLE_GM_KERNEL", start)
+    end = source.index("// kernel 入口", start)
     return source[start:end]
 
 
@@ -128,48 +128,64 @@ def test_fft_gm_uses_cann85_mix_1_to_2_message_protocol():
     assert "enableMixDualMaster" not in code
 
     gm_start = source.index("class FftConv1dFftGm")
-    gm_end = source.index("#endif // FFT_CONV1D_ENABLE_GM_KERNEL", gm_start)
+    gm_end = source.index("// kernel 入口", gm_start)
     gm_code = _without_cpp_comments(source[gm_start:gm_end])
     assert re.search(r"SyncAll\s*(?:<.*?>)?\s*\(", gm_code) is None, (
         "同步 IterateAll 已完成 KFC 握手，FFT-GM 不应再叠加外层 SyncAll"
     )
 
 
-def test_mix_1_to_2_maps_one_primary_aiv_to_each_logical_core():
+def test_mix_1_to_2_uses_both_flattened_aiv_workers():
     source = _without_cpp_comments(_source("op_kernel/fft_conv1d.cpp"))
-    core_idx = _function_slice(source, "int32_t CoreIdx(")
-    assert "GetBlockIdx()" in core_idx
-    assert "GetSubBlockIdx()" in core_idx
-    assert "GetTaskRation()" in core_idx
-
-    primary = _function_slice(source, "bool IsPrimaryAiv(")
-    assert re.search(r"GetSubBlockIdx\s*\(\s*\)\s*==\s*0", primary)
+    worker_idx = _function_slice(source, "int32_t VectorWorkerIdx(")
+    assert "GetBlockIdx()" in worker_idx
+    assert "GetSubBlockIdx()" not in worker_idx
+    assert "GetTaskRation()" not in worker_idx
 
     direct = source[
         source.index("class FftConv1dDirect"):
         source.index("class FftConv1dFft")
     ]
+    direct_init = _function_slice(direct, "void Init(")
     direct_process = _function_slice(direct, "void Process(")
-    assert "CoreIdx()" in direct_process
-    assert "GetBlockIdx()" not in direct_process
+    assert re.search(r"workers_\s*=\s*static_cast<int32_t>\s*"
+                     r"\(\s*t\.usedCoreNum\s*\)\s*\*\s*2", direct_init)
+    assert "VectorWorkerIdx()" in direct_process
+    assert "row += workers_" in direct_process
 
 
-def test_secondary_aiv_registers_before_quitting_fft_gm():
+def test_both_fft_gm_aivs_register_and_execute():
     source = _without_cpp_comments(_source("op_kernel/fft_conv1d.cpp"))
     branch_start = source.index("else if (tilingData.algo == ALGO_FFT_GM)")
-    branch_end = source.index("#endif", branch_start)
+    branch_end = source.index("else", branch_start + len("else"))
     branch = source[branch_start:branch_end]
     register = branch.index("REGIST_MATMUL_OBJ")
-    secondary_guard = branch.index("!IsPrimaryAiv()")
-    assert register < secondary_guard, (
-        "MIX 1:2 的第二个 AIV 必须先注册 KFC client，再退出并发送 quit"
-    )
+    init = branch.index("op.Init")
+    process = branch.index("op.Process")
+    assert register < init < process
+    assert "IsPrimaryAiv" not in branch
+    assert "return" not in branch
+
+
+def test_direct_and_fft_ub_do_not_drop_secondary_aiv():
+    source = _without_cpp_comments(_source("op_kernel/fft_conv1d.cpp"))
+    entry = source[source.index('extern "C" __global__'):]
+    assert "IsPrimaryAiv" not in entry
+
+    ub = source[source.index("class FftConv1dFft"):
+                source.index("class FftConv1dFftGm")]
+    ub_init = _function_slice(ub, "void Init(")
+    ub_process = _function_slice(ub, "void Process(")
+    assert re.search(r"workers_\s*=\s*static_cast<int32_t>\s*"
+                     r"\(\s*t\.usedCoreNum\s*\)\s*\*\s*2", ub_init)
+    assert "VectorWorkerIdx()" in ub_process
+    assert "h += workers_" in ub_process
 
 
 def test_fft_gm_offsets_past_the_system_workspace_once():
     source = _source("op_kernel/fft_conv1d.cpp")
     gm_start = source.index("class FftConv1dFftGm")
-    gm_end = source.index("#endif // FFT_CONV1D_ENABLE_GM_KERNEL", gm_start)
+    gm_end = source.index("// kernel 入口", gm_start)
     gm_code = _without_cpp_comments(source[gm_start:gm_end])
 
     assert gm_code.count("GetUserWorkspace") == 1, (
@@ -182,6 +198,51 @@ def test_fft_gm_offsets_past_the_system_workspace_once():
     ), (
         "GM Matmul 的 SetTensorA/B 会读取 GlobalTensor::GetSize；"
         "scratch GlobalTensor 必须显式设置元素数"
+    )
+
+
+def test_fft_gm_gives_each_aiv_worker_independent_scratch():
+    source = _without_cpp_comments(_source("op_kernel/fft_conv1d.cpp"))
+    gm = _fft_gm_source()
+    init = _function_slice(gm, "void Init(")
+    process = _function_slice(gm, "void Process(")
+
+    assert re.search(r"workers_\s*=\s*static_cast<int32_t>\s*"
+                     r"\(\s*t\.usedCoreNum\s*\)\s*\*\s*2", init)
+    assert "workerIdx_ = VectorWorkerIdx()" in init
+    assert re.search(
+        r"workspaceElements\s*=\s*static_cast<uint64_t>\s*"
+        r"\(\s*workers_\s*\)\s*\*\s*FFT_GM_BUFFER_COUNT",
+        init,
+    )
+    assert re.search(
+        r"base_\s*=\s*static_cast<uint64_t>\s*\(\s*workerIdx_\s*\)\s*"
+        r"\*\s*FFT_GM_BUFFER_COUNT\s*\*\s*N_",
+        init,
+    )
+    assert "h = workerIdx_" in process
+    assert "h += workers_" in process
+    assert "Half(" not in gm
+    assert "subIdx_" not in gm
+
+
+def test_host_counts_mix_groups_but_allocates_all_aiv_workers():
+    host = _without_cpp_comments(_source("op_host/fft_conv1d.cpp"))
+    header = _without_cpp_comments(_source("op_host/fft_conv1d_tiling.h"))
+    kernel = _without_cpp_comments(_source("op_kernel/fft_conv1d.cpp"))
+
+    assert re.search(
+        r"FFT_CONV1D_GM_BUFFER_COUNT\s*=\s*12U?\s*;",
+        header,
+    ), "FFT-GM buffer count must be defined in the included Host tiling header"
+    assert re.search(r"FFT_GM_BUFFER_COUNT\s*=\s*12\s*;", kernel)
+    assert "neededGroupNum = CeilDiv(splitUnit, 2)" in host
+    assert "vectorWorkerNum = usedCoreNum * 2" in host
+    assert re.search(
+        r"userWorkspace\s*=\s*static_cast<size_t>\s*"
+        r"\(\s*vectorWorkerNum\s*\)\s*\*\s*"
+        r"FFT_CONV1D_GM_BUFFER_COUNT",
+        host,
     )
 
 

@@ -43,10 +43,11 @@ constexpr uint32_t FFT_CONV1D_FFT_MIN_K = 64;
 constexpr uint32_t FFT_CONV1D_DIRECT_TILE = 4096; // direct 路径的输出分块长度
 
 // FFT-UB 全部数据常驻 UB，不需要用户 workspace。
-// FFT-GM 每核在 workspace 上占用下列 12 个长度 N_fft 的缓冲：
+// FFT-GM 每个 AIV worker 在 workspace 上占用下列 12 个长度 N_fft 的缓冲：
 //   Dr Di Tr Ti  Kfr Kfi  Xr Xi  Yr Yi  Zr Zi
-// 必须与 op_kernel 里的 GM_BUFS 保持一致（两侧共同决定 workspace 的分片布局）。
-constexpr uint32_t FFT_CONV1D_GM_BUFS = 12;
+// 必须与 op_kernel 里的 FFT_GM_BUFFER_COUNT 保持一致（两侧共同决定
+// workspace 的分片布局）。定义放在本头文件中，Host 编译单元包含后可直接使用。
+constexpr uint32_t FFT_CONV1D_GM_BUFFER_COUNT = 12U;
 
 BEGIN_TILING_DATA_DEF(FftConv1dTilingData)
 TILING_DATA_FIELD_DEF(uint32_t, batch);      // B

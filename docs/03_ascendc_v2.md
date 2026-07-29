@@ -45,12 +45,10 @@ Host 静态分派：
 
 | 条件 | 路径 | 当前执行方式 |
 |---|---|---|
-| `K < 64` | DIRECT | 主 AIV 上直接因果卷积 |
-| `K >= 64 && need <= 1024` | FFT-UB | 数据常驻 UB；当前 `FFT_CONV1D_USE_CUBE=0`，矩阵乘为 Vector Axpy 基线 |
+| `K < 64` | DIRECT | 两个 AIV 按输入行交错执行直接因果卷积 |
+| `K >= 64 && need <= 1024` | FFT-UB | 数据常驻 UB；Cube 执行 Matmul，Vector 执行旋转因子与逐点运算 |
 | `K >= 64 && 1024 < need <= 4096` | FFT-GM | `N=4096`；Cube 执行 GM Matmul，Vector 执行旋转因子与逐点运算 |
 | `need > 4096` | DIRECT 回退 | 保持数值覆盖，性能较慢 |
-
-`FFT_CONV1D_ENABLE_GM` 与 `FFT_CONV1D_ENABLE_GM_KERNEL` 必须同时启用或同时关闭。
 
 ## 3. Host tiling 与核切分
 
@@ -62,8 +60,9 @@ min(GetCoreNumAic(), GetCoreNumAiv() / 2)
 ```
 
 - DIRECT 按 `B*H` 行切；
-- FFT-UB、FFT-GM 按通道 `H` 切，每个逻辑核处理所分通道的全部 batch；
-- `blockDim` 等于实际使用的逻辑组数。
+- FFT-UB、FFT-GM 按通道 `H` 切，每个 AIV worker 处理所分通道的全部 batch；
+- `blockDim = min(ceil(splitUnit/2), availableMixGroups)`；
+- `vectorWorkerNum = 2 * blockDim`。任务数为奇数时，最后一个 worker 没有工作。
 
 FFT-GM 的 Matmul tiling 与 kernel 类型一致：
 
@@ -87,23 +86,18 @@ FFT-GM 自有临时 UB 为：
 
 ## 4. MIX 1:2 与 KFC 生命周期
 
-在 1:2 模式下，AIV 的 `GetBlockIdx()` 是展开后的索引。AIC、两个 AIV 使用同一
-逻辑核号：
+在 1:2 模式下，AIV 的 `GetBlockIdx()` 已经是展开后的 worker 索引：
 
 ```cpp
-CoreIdx = (GetBlockIdx() - GetSubBlockIdx()) / GetTaskRation();
+workerIdx = GetBlockIdx();        // 0, 1, ..., 2*blockDim-1
+workerNum = usedCoreNum * 2;      // usedCoreNum 仍表示 MIX 组数
 ```
 
-每组只允许 `subBlockIdx == 0` 的主 AIV 执行用户 Vector/DMA 数据流。
-
-- DIRECT、非 Cube 的 FFT-UB：AIC 和第二个 AIV 直接退出；
+- DIRECT：AIC 退出，两个 AIV 按 `row = workerIdx + n*workerNum` 分行；
 - FFT-GM：AIC 和两个 AIV 都必须先执行 `REGIST_MATMUL_OBJ`；
-- 第二个 AIV 注册后立即退出，其栈上 KFC client 析构并发送 `SERVICE_QUIT`；
-- 主 AIV 发起全部 Matmul，完成后析构并发送另一个 quit；
+- FFT-UB、FFT-GM 的两个 AIV client 都执行，按
+  `h = workerIdx + n*workerNum` 分通道，并各自发起本通道的 Matmul；
 - AIC 在 `REGIST_MATMUL_OBJ` 展开的 server 循环中服务消息，收到两个 quit 后返回。
-
-第二个 AIV 不能在 `REGIST_MATMUL_OBJ` 之前退出，否则 CANN 8.5 的 KFC server
-会一直等待缺失的 client 生命周期。
 
 同步版 `IterateAll(GlobalTensor)` 完成 AIV→AIC→AIV 的消息握手和结果等待。
 FFT-GM 不再叠加外层 `SyncAll` 或手工 CrossCore flag，以免与 Matmul 内部 flag
@@ -120,7 +114,7 @@ Host 总 workspace：
 系统区大小由 `GetLibApiWorkSpaceSize()` 给出。FFT-GM 用户区大小为：
 
 ```text
-usedCoreNum * 12 * N * sizeof(float)
+(2 * usedCoreNum) * 12 * N * sizeof(float)
 ```
 
 kernel 入口的 `workspace` 指向整块空间首址。Matmul 使用
@@ -128,7 +122,7 @@ kernel 入口的 `workspace` 指向整块空间首址。Matmul 使用
 `GetUserWorkspace(workspace)` 定位用户区；直接从 offset 0 写 scratch 会覆盖
 KFC 消息队列。
 
-每个逻辑核独占 12 个长度 `N` 的 float 槽：
+每个 AIV worker 独占 12 个长度 `N` 的 float 槽：
 
 ```text
 Dr, Di, Tr, Ti, Kr, Ki, Xr, Xi, Yr, Yi, Zr, Zi
@@ -136,8 +130,8 @@ Dr, Di, Tr, Ti, Kr, Ki, Xr, Xi, Yr, Yi, Zr, Zi
 
 处理顺序：
 
-1. 主 AIV 在 UB 生成本核的 `D` 与 twiddle 表并写入本核 GM 槽；
-2. 按 `h = CoreIdx, CoreIdx + usedCoreNum, ...` 计算并缓存该通道的 kernel 频谱；
+1. 每个 AIV 在自己的 UB 生成 `D` 与 twiddle 表并写入自己的 GM 槽；
+2. 按 `h = workerIdx, workerIdx + vectorWorkerNum, ...` 计算并缓存该通道的 kernel 频谱；
 3. 对该通道的每个 batch 执行输入 FFT、复数逐点乘、IFFT；
 4. IFFT 在最后一步乘 `1/N`；
 5. causal 输出直接裁剪线性卷积的 `[0:L]`。
@@ -151,7 +145,7 @@ Cube 的 A/B/C 都在 GM；Vector 运算前把所需平面搬到 UB，完成后�
 
 - FFT-UB：无用户 workspace；
 - DIRECT：Host 当前申请
-  `2 * usedCoreNum * AlignUp8(K-1+L) * sizeof(float)`，kernel 每个主 AIV使用一行
+  `2 * usedCoreNum * AlignUp8(K-1+L) * sizeof(float)`，kernel 每个 AIV worker 使用一行
   零前缀缓冲。
 
 ## 7. 验证
