@@ -106,7 +106,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         {
             algo = FFT_CONV1D_ALGO_FFT;
         }
-        else if (nFft <= FFT_CONV1D_MAX_NFFT_GM)
+        else
         {
             algo = FFT_CONV1D_ALGO_FFT_GM;
         }
@@ -172,44 +172,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         mmT.SetShape(s1, s1, s1);
         mmT.SetOrgShape(s1, s1, s1);
         mmT.SetBias(false);
-        int32_t matmulUbBudget = -1;
-        if (gmPath)
-        {
-            // FFT-GM 自有 UB：
-            //   6 * N * fp32 + 2 * AlignUp8(N1) * fp32 + 8 KiB shared tmp。
-            // N=4096、N1=64 时为 107008B。SetBufferSpace 的第三个参数是
-            // Matmul 实际可用 UB，不能继续传 -1（表示整块 UB），否则 tiling 会
-            // 与 kernel 的 TPipe 缓冲重复规划同一片 UB。
-            constexpr uint64_t kGmFullBuffers = 6;
-            constexpr uint64_t kGmTmpBytes = 8 * 1024;
-            constexpr int32_t kCompatMatmulUbBudget = 48 * 1024;
-            const uint64_t alignedRadix = (static_cast<uint64_t>(nRadix) + 7U) & ~7ULL;
-            const uint64_t gmOwnedUb =
-                kGmFullBuffers * static_cast<uint64_t>(nFft) * sizeof(float) +
-                2U * alignedRadix * sizeof(float) + kGmTmpBytes;
-
-            uint64_t ubSize = 0;
-            ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
-            if (ubSize == 0)
-            {
-                // 部分旧版 platform stub 不返回 UB 大小；沿用已验证过的保守预算。
-                matmulUbBudget = kCompatMatmulUbBudget;
-            }
-            else if (ubSize <= gmOwnedUb)
-            {
-                printf("[fft_conv1d tiling] FFT-GM UB 不足: total=%llu owned=%llu\n",
-                       static_cast<unsigned long long>(ubSize),
-                       static_cast<unsigned long long>(gmOwnedUb));
-                return ge::GRAPH_FAILED;
-            }
-            else
-            {
-                const uint64_t availableUb = (ubSize - gmOwnedUb) & ~31ULL;
-                matmulUbBudget = static_cast<int32_t>(
-                    availableUb > 0x7fffffffULL ? 0x7fffffffULL : availableUb);
-            }
-        }
-        mmT.SetBufferSpace(-1, -1, matmulUbBudget);
+        mmT.SetBufferSpace(-1, -1, -1);
         if (mmT.GetTiling(tilingData.cubeTiling) == -1)
         {
             // 不能只警告后继续：kernel 会拿着未初始化的 cubeTiling 去跑，
