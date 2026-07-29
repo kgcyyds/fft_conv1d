@@ -549,6 +549,15 @@ class FftConv1dFftGm
         N_ = t.nFft;
         N1_ = t.nRadix;
         cores_ = t.usedCoreNum;
+        // 两个 AIV 分担逐点运算：各自处理不相交的 chunk。
+        // VEC_CHUNK 是 8 的倍数，故两者的起始偏移都天然 32B 对齐。
+        subIdx_ = static_cast<int32_t>(GetSubBlockIdx());
+        subNum_ = static_cast<int32_t>(GetTaskRation()); // AIV 上为 2
+        if (subNum_ < 1)
+        {
+            subNum_ = 1;
+        }
+        chunkStep_ = VEC_CHUNK * subNum_;
 
         xGm_.SetGlobalBuffer((__gm__ float *)x);
         wGm_.SetGlobalBuffer((__gm__ float *)w);
@@ -641,7 +650,7 @@ class FftConv1dFftGm
     __aicore__ inline void CopyG(uint64_t dst, uint64_t src)
     {
         LocalTensor<float> t = b0_.Get<float>();
-        for (int32_t o = 0; o < N_; o += VEC_CHUNK)
+        for (int32_t o = subIdx_ * VEC_CHUNK; o < N_; o += chunkStep_)
         {
             const int32_t len = MinU(VEC_CHUNK, N_ - o);
             LoadG(t, src + o, len);
@@ -669,7 +678,7 @@ class FftConv1dFftGm
 
         CreateVecIndex(idx, 0.0f, N1_);
         PipeBarrier<PIPE_V>();
-        for (int32_t k = 0; k < N1_; ++k)
+        for (int32_t k = subIdx_; k < N1_; k += subNum_)
         {
             const uint64_t off = static_cast<uint64_t>(k) * N1_;
             Row(re, im, idx, ang, tmp, k, N1_);
@@ -739,7 +748,7 @@ class FftConv1dFftGm
         LocalTensor<float> a = b0_.Get<float>();
         LocalTensor<float> b = b1_.Get<float>();
         LocalTensor<float> c = b2_.Get<float>();
-        for (int32_t o = 0; o < N_; o += VEC_CHUNK)
+        for (int32_t o = subIdx_ * VEC_CHUNK; o < N_; o += chunkStep_)
         {
             const int32_t len = MinU(VEC_CHUNK, N_ - o);
             LoadG(a, oa + o, len);
@@ -776,7 +785,7 @@ class FftConv1dFftGm
         LocalTensor<float> bi = b3_.Get<float>();
         LocalTensor<float> t0 = b4_.Get<float>();
         LocalTensor<float> t1 = b5_.Get<float>();
-        for (int32_t o = 0; o < N_; o += VEC_CHUNK)
+        for (int32_t o = subIdx_ * VEC_CHUNK; o < N_; o += chunkStep_)
         {
             const int32_t len = MinU(VEC_CHUNK, N_ - o);
             LoadG(ar, oar + o, len);
@@ -852,7 +861,7 @@ class FftConv1dFftGm
             return;
         }
         LocalTensor<float> a = b0_.Get<float>();
-        for (int32_t o = 0; o < N_; o += VEC_CHUNK)
+        for (int32_t o = subIdx_ * VEC_CHUNK; o < N_; o += chunkStep_)
         {
             const int32_t len = MinU(VEC_CHUNK, N_ - o);
             Duplicate(a, 0.0f, len);
@@ -881,7 +890,7 @@ class FftConv1dFftGm
             return;
         }
         LocalTensor<float> a = b0_.Get<float>();
-        for (int32_t o = 0; o < L_; o += VEC_CHUNK)
+        for (int32_t o = subIdx_ * VEC_CHUNK; o < L_; o += chunkStep_)
         {
             const int32_t len = MinU(VEC_CHUNK, L_ - o);
             LoadG(a, Buf(XR) + o, len);
@@ -899,6 +908,7 @@ class FftConv1dFftGm
     TBuf<TPosition::VECCALC> bIdx_, bAng_, bQ_, bQi_, bTmp_;
     uint64_t base_;
     int32_t B_, H_, L_, K_, N_, N1_, cores_;
+    int32_t subIdx_, subNum_, chunkStep_;
 };
 
 
@@ -936,10 +946,7 @@ extern "C" __global__ __aicore__ void fft_conv1d(GM_ADDR x, GM_ADDR kernel, GM_A
         // REGIST_MATMUL_OBJ，再退出；不能在注册前直接 return。
         if ASCEND_IS_AIV
         {
-            if (!IsPrimaryAiv())
-            {
-                return;
-            }
+            // 两个 AIV 都参与：逐点运算已按 sub-block 切成不相交的 chunk
         }
         op.Init(&pipe, x, kernel, y, workspace, tilingData);
         op.Process();
